@@ -1,0 +1,455 @@
+"""Shared transcription helpers: note extraction, beat grid, MIDI/MusicXML export."""
+from dataclasses import dataclass
+
+import librosa
+import numpy as np
+import pretty_midi
+import scipy.ndimage as ndi
+import scipy.signal as sps
+
+SR = 22050
+HOP = 256
+PITCH_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+
+@dataclass
+class Note:
+    start: float
+    end: float
+    pitch: int
+    amp: float = 0.8
+    conf: float = 1.0  # 0..1, how sure the pitch is (single-line parts only)
+    off: float = 0.0  # how far the sung pitch sat from the written note, in semitones (+ = sharp)
+    eff: float = 0.0  # length of the held note this fragment belongs to (see duet.effective_durations)
+
+    @property
+    def dur(self):
+        return self.end - self.start
+
+
+def name(p):
+    return "%s%d" % (PITCH_NAMES[p % 12], p // 12 - 1)
+
+
+def load_mono(path, sr=SR):
+    y, _ = librosa.load(path, sr=sr, mono=True)
+    return y
+
+
+# ---------------------------------------------------------------- single-line parts
+def track_f0(y, fmin, fmax, sr=SR, gate_db=-40.0, cache=None):
+    """pYIN pitch curve in (fractional) MIDI numbers, NaN where nothing is sung; plus loudness and
+    the tracker's own per-frame probability that a pitched sound is present."""
+    if cache is not None and cache.exists():
+        d = np.load(cache)
+        if "prob" in d:
+            return d["midi"], d["rms"], d["prob"]
+    f0, voiced, prob = librosa.pyin(y, fmin=fmin, fmax=fmax, sr=sr, frame_length=2048, hop_length=HOP, fill_na=np.nan)
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=HOP)[0][: len(f0)]
+    loud = 20 * np.log10(rms / (rms.max() + 1e-9) + 1e-9) > gate_db
+    ok = voiced & loud & np.isfinite(f0)
+    midi = np.full(len(f0), np.nan)
+    midi[ok] = librosa.hz_to_midi(f0[ok])
+    if cache is not None:
+        np.savez(cache, midi=midi, rms=rms, prob=prob)
+    return midi, rms, prob
+
+
+def segment_notes(midi, rms, prob=None, sr=SR, min_dur=0.12, smooth_frames=11, leave=0.65, hold_frames=5, max_gap=3):
+    """Cut a pitch curve into notes.
+
+    A note continues until the smoothed pitch has left its semitone by more than `leave`
+    for `hold_frames` in a row, so vibrato and scoops do not split it.
+    Returns (notes, tuning_offset_in_semitones).
+    """
+    ok = np.isfinite(midi)
+    if ok.sum() < 10:
+        return [], 0.0
+    dev = midi[ok] - np.round(midi[ok])
+    hist, edges = np.histogram(dev, bins=20, range=(-0.5, 0.5))
+    tuning = float(edges[np.argmax(hist)] + 0.025)  # recording may sit between piano keys
+    midi = midi - tuning
+    idx = np.where(ok)[0]
+    runs = np.split(idx, np.where(np.diff(idx) > max_gap)[0] + 1)
+    min_frames = max(2, int(min_dur * sr / HOP))
+    t = lambda i: i * HOP / sr
+    notes = []
+    for r in runs:
+        a, b = r[0], r[-1] + 1
+        seg = midi[a:b].copy()
+        bad = ~np.isfinite(seg)
+        if bad.any():
+            seg[bad] = np.interp(np.where(bad)[0], np.where(~bad)[0], seg[~bad])
+        s = ndi.median_filter(seg, size=smooth_frames, mode="nearest")
+        segs, start, center, away = [], 0, int(round(s[0])), 0
+        for i in range(len(s)):
+            away = away + 1 if abs(s[i] - center) > leave else 0
+            if away >= hold_frames:
+                cut = i - hold_frames + 1
+                if cut > start:
+                    segs.append([start, cut, center])
+                start, center, away = cut, int(round(np.median(s[cut : i + 1]))), 0
+        segs.append([start, len(s), center])
+        # fold slides and blips into the neighbour that is closer in pitch
+        changed = True
+        while changed and len(segs) > 1:
+            changed = False
+            for i, (s0, e0, p) in enumerate(segs):
+                if e0 - s0 < min_frames:
+                    left = segs[i - 1] if i > 0 else None
+                    right = segs[i + 1] if i + 1 < len(segs) else None
+                    if left and (not right or abs(left[2] - p) <= abs(right[2] - p)):
+                        left[1] = e0
+                    else:
+                        right[0] = s0
+                    segs.pop(i)
+                    changed = True
+                    break
+        merged = []
+        for s0, e0, p in segs:
+            if merged and merged[-1][2] == p:
+                merged[-1][1] = e0
+            else:
+                merged.append([s0, e0, p])
+        prev_end = None
+        for s0, e0, p in merged:
+            if e0 - s0 < min_frames:
+                continue
+            med = np.median(s[s0:e0])
+            held = np.mean(np.abs(s[s0:e0] - med) <= 0.5)
+            if held < 0.6:
+                # the pitch never settles: a slide between notes or a fall at the end of a phrase.
+                # Let the previous note ring through it instead of inventing stair-step notes.
+                if prev_end == s0 and notes:
+                    notes[-1].end = t(a + e0)
+                    prev_end = e0
+                continue
+            amp = float(np.clip(rms[a + s0 : a + e0].mean() / (rms.max() + 1e-9) * 2, 0.3, 1.0))
+            # confidence: the tracker is sure there is a pitch, and the pitch sits still on one note
+            sure = float(np.mean(prob[a + s0 : a + e0])) if prob is not None else 1.0
+            notes.append(Note(t(a + s0), t(a + e0), int(round(med)), amp, conf=sure * float(held), off=float(med - round(med))))
+            prev_end = e0
+    # an isolated note an octave away from both neighbours is a tracker slip, not a leap
+    for i in range(1, len(notes) - 1):
+        lo, n, hi = notes[i - 1], notes[i], notes[i + 1]
+        for shift in (12, -12):
+            if abs(n.pitch + shift - lo.pitch) <= 4 and abs(n.pitch + shift - hi.pitch) <= 4 and abs(n.pitch - lo.pitch) >= 8 and n.dur < 0.6:
+                n.pitch += shift
+                break
+    return notes, tuning
+
+
+def mono_notes(y, fmin, fmax, cache=None, **kw):
+    midi, rms, prob = track_f0(y, fmin, fmax, cache=cache)
+    return segment_notes(midi, rms, prob, **kw)
+
+
+_DIATONIC = (0, 2, 4, 5, 7, 9, 11)
+
+
+def best_scale(weights):
+    """The seven-note major-scale set (any of 12 transpositions) that holds the most weight."""
+    w = np.asarray(weights, float)
+    w = w / (w.sum() + 1e-9)
+    fits = [(sum(w[(r + k) % 12] for k in _DIATONIC), r) for r in range(12)]
+    fit, root = max(fits)
+    return {(root + k) % 12 for k in _DIATONIC}, PITCH_NAMES[root] + " major scale notes", float(fit), float(sorted(fits)[-2][0])
+
+
+def autotune(notes, scale):
+    """Move notes that fall outside the scale by one semitone onto it.
+
+    The note goes to the side the singer was leaning toward when that side is in the scale,
+    otherwise to whichever neighbour is. Notes already in the scale are left alone."""
+    moved = 0
+    for n in notes:
+        if n.pitch % 12 in scale:
+            continue
+        lean = 1 if n.off >= 0 else -1
+        for d in (lean, -lean):
+            if (n.pitch + d) % 12 in scale:
+                n.pitch += d
+                moved += 1
+                break
+    merged = []
+    for n in notes:  # two notes that became the same pitch back to back are one note
+        if merged and merged[-1].pitch == n.pitch and n.start - merged[-1].end <= 0.03:
+            merged[-1].end = n.end
+            merged[-1].conf = max(merged[-1].conf, n.conf)
+        else:
+            merged.append(n)
+    return merged, moved
+
+
+def settle_uncertain(notes, threshold, max_step=2, gap=0.06):
+    """Clean up notes the tracker was unsure about (spoken or breathy singing).
+
+    1. An unsure note that follows a sure one within `max_step` semitones is treated as that
+       note still sounding (sustain) instead of a new pitch.
+    2. Any other unsure note is pulled onto the nearest pitch the singer clearly uses elsewhere.
+    Unsure notes keep conf < threshold so they can be shown differently in the score.
+    """
+    sure = [n for n in notes if n.conf >= threshold]
+    w = np.zeros(12)
+    for n in sure:
+        w[n.pitch % 12] += n.dur * n.conf
+    allowed = set(np.argsort(w)[::-1][:7]) if w.sum() > 0 else set(range(12))
+    out, sustained, moved = [], 0, 0
+    for n in notes:
+        if n.conf >= threshold:
+            out.append(n)
+            continue
+        prev = out[-1] if out else None
+        if prev is not None and prev.conf >= threshold and n.start - prev.end <= gap and abs(n.pitch - prev.pitch) <= max_step:
+            prev.end = n.end
+            sustained += 1
+            continue
+        if n.pitch % 12 not in allowed:
+            for d in (1, -1, 2, -2):
+                if (n.pitch + d) % 12 in allowed:
+                    n.pitch += d
+                    moved += 1
+                    break
+        out.append(n)
+    return out, {"sustained_into_previous": sustained, "moved_to_scale": moved, "scale_pitch_classes": sorted(PITCH_NAMES[i] for i in allowed)}
+
+
+def synth(notes, length, sr=SR, shift=0, partials=(1, 2, 3)):
+    """Plain tone rendering of notes, for side-by-side listening against the recording."""
+    out = np.zeros(length, dtype=np.float32)
+    for n in notes:
+        a, b = int(n.start * sr), min(int(n.end * sr), length)
+        if b - a < 32:
+            continue
+        tt = np.arange(b - a) / sr
+        f = 440.0 * 2 ** ((n.pitch + shift - 69) / 12)
+        w = sum(np.sin(2 * np.pi * f * k * tt) / k for k in partials) * 0.2 * n.amp
+        fade = min(256, (b - a) // 2)
+        w[:fade] *= np.linspace(0, 1, fade)
+        w[-fade:] *= np.linspace(1, 0, fade)
+        out[a:b] += w.astype(np.float32)
+    return out
+
+
+def write_check(path, original, notes, sr=SR, shift=0):
+    """Stereo file: recording in the left ear, transcription in the right.
+
+    `shift` plays the transcription that many semitones higher (a bass line an octave up is
+    audible on small speakers; the written notes are unchanged)."""
+    import soundfile as sf
+
+    tone = synth(notes, len(original), sr, shift=shift)
+    o = original / (np.abs(original).max() + 1e-9) * 0.7
+    tone = tone / (np.abs(tone).max() + 1e-9) * 0.6
+    sf.write(str(path), np.stack([o, tone], axis=1), sr)
+
+
+# ---------------------------------------------------------------- multi-note parts
+_BP_MODEL = None
+
+
+def poly_notes(path, fmin=None, fmax=None, onset=0.5, frame=0.3, min_ms=110, gate_db=-40.0):
+    """Transcribe several simultaneous notes with Basic Pitch (ONNX, CPU)."""
+    global _BP_MODEL
+    import basic_pitch
+    from basic_pitch.inference import Model, predict
+
+    if _BP_MODEL is None:
+        _BP_MODEL = Model(basic_pitch.build_icassp_2022_model_path(basic_pitch.FilenameSuffix.onnx))
+    _, _, events = predict(
+        str(path),
+        _BP_MODEL,
+        onset_threshold=onset,
+        frame_threshold=frame,
+        minimum_note_length=min_ms,
+        minimum_frequency=fmin,
+        maximum_frequency=fmax,
+        melodia_trick=True,
+    )
+    notes = [Note(float(s), float(e), int(p), float(a)) for s, e, p, a, _ in events]
+    if gate_db is not None and notes:
+        # the model also "hears" notes in near-silent leftovers of a stem; keep only notes
+        # where the recording itself is audible
+        y = load_mono(path)
+        rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
+        db = 20 * np.log10(rms / (rms.max() + 1e-9) + 1e-9)
+        f = lambda t: int(t * SR / 512)
+        notes = [n for n in notes if db[f(n.start) : max(f(n.end), f(n.start) + 1)].mean() > gate_db]
+    return sorted(notes, key=lambda n: (n.start, n.pitch))
+
+
+# ---------------------------------------------------------------- rhythm grid
+def beat_grid(y, sr=SR, start_bpm=90):
+    tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=512, start_bpm=start_bpm, units="time")
+    beats = np.asarray(beats, dtype=float)
+    ibi = np.diff(beats)
+    bpm = 60.0 / np.median(ibi)
+    jitter = float(np.std(ibi) / np.mean(ibi))
+    return beats, float(bpm), jitter
+
+
+def to_beats(t, beats):
+    """Map seconds to (fractional) beat index, extrapolating at both ends."""
+    step = np.median(np.diff(beats))
+    ext = np.r_[beats[0] - 64 * step, beats, beats[-1] + 64 * step]
+    pos = np.r_[-64.0, np.arange(len(beats)), len(beats) - 1 + 64.0]
+    return np.interp(t, ext, pos)
+
+
+def warp(notes, beats, bpm, grid=None):
+    """Put notes on a constant-tempo timeline so a notation program reads them on the beat."""
+    out = []
+    for n in notes:
+        s, e = to_beats(n.start, beats), to_beats(n.end, beats)
+        if grid:
+            s = round(s * grid) / grid
+            e = max(round(e * grid) / grid, s + 1.0 / grid)
+        out.append(Note(s * 60 / bpm, e * 60 / bpm, n.pitch, n.amp, n.conf, n.off))
+    return out
+
+
+def drum_hits(y, sr=SR):
+    """Kick / snare / hi-hat hits from a drum stem, as General-MIDI drum notes (36 / 38 / 42).
+
+    Each onset is labelled by where its energy sits: low band = kick, high band = hi-hat,
+    otherwise snare. A hit with both strong lows and strong highs is written as kick + hat."""
+    hop = 256
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    frames = librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=hop, backtrack=False, delta=0.12, wait=4)
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop)) ** 2
+    f = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    lo, mid, hi = (f >= 30) & (f < 130), (f >= 150) & (f < 3000), f >= 5500
+    peak = env.max() + 1e-9
+    hits = []
+    for fr in frames:
+        w = S[:, fr : fr + 6].sum(axis=1)
+        tot = w.sum() + 1e-12
+        l, m, h = w[lo].sum() / tot, w[mid].sum() / tot, w[hi].sum() / tot
+        t, amp = fr * hop / sr, float(np.clip(env[fr] / peak * 1.5, 0.3, 1.0))
+        if l > 0.4:
+            hits.append(Note(t, t + 0.1, 36, amp))
+            if h > 0.2:
+                hits.append(Note(t, t + 0.1, 42, amp * 0.7))
+        elif h > 0.45 and m < 0.45:
+            hits.append(Note(t, t + 0.1, 42, amp * 0.7))
+        else:
+            hits.append(Note(t, t + 0.1, 38, amp))
+    return hits
+
+
+# ---------------------------------------------------------------- harmony
+_MAJ = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_MIN = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+
+def pitch_class_weights(notes):
+    w = np.zeros(12)
+    for n in notes:
+        w[n.pitch % 12] += n.dur
+    return w
+
+
+def estimate_key(chroma_mean):
+    best = (-2, "")
+    for i in range(12):
+        for prof, label in ((_MAJ, "major"), (_MIN, "minor")):
+            c = np.corrcoef(np.roll(prof, i), chroma_mean)[0, 1]
+            if c > best[0]:
+                best = (c, "%s %s" % (PITCH_NAMES[i], label))
+    return best[1], float(best[0])
+
+
+def beat_chords(y, beats, sr=SR, per=2):
+    """One chord label per `per` beats, from triad templates on beat-averaged chroma."""
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512, bins_per_octave=36)
+    frames = librosa.time_to_frames(beats, sr=sr, hop_length=512)
+    sync = librosa.util.sync(chroma, frames, aggregate=np.median)[:, 1:]
+    n = sync.shape[1] // per
+    grouped = sync[:, : n * per].reshape(12, n, per).mean(axis=2)
+    templates, labels = [], []
+    for r in range(12):
+        for iv, suffix in (((0, 4, 7), ""), ((0, 3, 7), "m")):
+            v = np.zeros(12)
+            v[[(r + k) % 12 for k in iv]] = 1
+            templates.append(v / np.linalg.norm(v))
+            labels.append(PITCH_NAMES[r] + suffix)
+    T = np.array(templates)
+    g = grouped / (np.linalg.norm(grouped, axis=0, keepdims=True) + 1e-9)
+    score = T @ g
+    return [labels[i] for i in score.argmax(axis=0)], chroma.mean(axis=1)
+
+
+# ---------------------------------------------------------------- checks and export
+def chroma_agreement(notes, y, sr=SR):
+    """Correlation between audio chroma and the chroma implied by the notes (1.0 = identical)."""
+    hop = 2048
+    ca = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    roll = np.zeros_like(ca)
+    for n in notes:
+        a, b = int(n.start * sr / hop), int(np.ceil(n.end * sr / hop))
+        roll[n.pitch % 12, a : max(b, a + 1)] += 1
+    active = roll.sum(axis=0) > 0
+    if active.sum() < 5:
+        return float("nan")
+    return float(np.corrcoef(ca[:, active].ravel(), roll[:, active].ravel())[0, 1])
+
+
+def polyphony_profile(notes, step=0.02):
+    if not notes:
+        return {}
+    T = np.arange(0, max(n.end for n in notes), step)
+    count = np.zeros(len(T), int)
+    for n in notes:
+        count[int(n.start / step) : int(n.end / step)] += 1
+    sounding = count > 0
+    return {k: float((count[sounding] == k).mean()) for k in range(1, 5)} | {
+        "5+": float((count[sounding] >= 5).mean())
+    }
+
+
+def write_midi(path, tracks, bpm):
+    """tracks: list of (name, General-MIDI program, notes)."""
+    pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+    for label, program, notes in tracks:
+        inst = pretty_midi.Instrument(program=0, is_drum=True, name=label) if program == "drums" else pretty_midi.Instrument(program=program, name=label)
+        for n in notes:
+            inst.notes.append(
+                pretty_midi.Note(velocity=int(40 + 70 * min(n.amp, 1.0)), pitch=n.pitch, start=max(n.start, 0), end=max(n.end, n.start + 0.05))
+            )
+        pm.instruments.append(inst)
+    pm.write(str(path))
+
+
+def write_musicxml(path, tracks, bpm, key=None, meter="4/4", unsure_below=None):
+    """tracks: list of (name, clef, notes) with note times already on the constant-tempo grid."""
+    from music21 import chord as m21chord
+    from music21 import clef, instrument, metadata, meter as m21meter, note as m21note, stream, tempo
+    from music21 import key as m21key
+
+    score = stream.Score()
+    score.insert(0, metadata.Metadata())
+    spb = 60.0 / bpm
+    for label, clef_name, notes in tracks:
+        part = stream.Part()
+        inst = instrument.Instrument()
+        inst.partName = label
+        part.insert(0, inst)
+        part.insert(0, {"treble": clef.TrebleClef(), "treble8vb": clef.Treble8vbClef(), "bass": clef.BassClef()}[clef_name])
+        part.insert(0, m21meter.TimeSignature(meter))
+        part.insert(0, tempo.MetronomeMark(number=round(bpm)))
+        if key:
+            tonic, mode = key.split()
+            part.insert(0, m21key.Key(tonic.replace("b", "-"), mode))
+        by_onset = {}
+        for n in notes:
+            by_onset.setdefault(round(n.start / spb * 4) / 4, []).append(n)
+        for on, group in sorted(by_onset.items()):
+            ql = max(0.25, round(max(g.end - g.start for g in group) / spb * 4) / 4)
+            el = m21note.Note(group[0].pitch) if len(group) == 1 else m21chord.Chord(sorted({g.pitch for g in group}))
+            el.quarterLength = ql
+            if unsure_below is not None and len(group) == 1 and group[0].conf < unsure_below:
+                el.notehead = "x"  # pitch is a guess: spoken or unclear
+            part.insert(on, el)
+        part.makeVoices(inPlace=True, fillGaps=True) if part.hasVoices() else None
+        score.insert(0, part.makeMeasures().makeTies().makeRests(fillGaps=True, inPlace=False))
+    score.write("musicxml", fp=str(path))
