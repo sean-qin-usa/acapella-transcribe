@@ -249,6 +249,33 @@ def crossings(A, B, step=0.05):
     return int((np.diff(sign) != 0).sum()), float((sign < 0).mean()) if len(sign) else 0.0, float(both.mean())
 
 
+FAMILIES = {"piano": (0, 8), "strings": (40, 56), "brass": (56, 64), "reed": (64, 72), "pipe": (72, 80), "guitar": (24, 32), "bass": (32, 40)}
+
+
+def note_number(name):
+    """MIDI number of a note name such as G3, C#4 or Bb2 (middle C is C4 = 60)."""
+    steps = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+    letter, rest = name[0].upper(), name[1:]
+    shift = 1 if rest.startswith("#") else -1 if rest.startswith("b") else 0
+    return 12 * (int(rest.lstrip("#b")) + 1) + steps[letter] + shift
+
+
+def notes_from_midi(path, family):
+    """(notes of the chosen family, every other pitched note, {track name: note count})."""
+    import pretty_midi
+
+    lo, hi = FAMILIES[family]
+    chosen, rest, labels = [], [], {}
+    for inst in pretty_midi.PrettyMIDI(str(path)).instruments:
+        if inst.is_drum:
+            continue
+        name = pretty_midi.program_to_instrument_name(inst.program)
+        labels[name] = labels.get(name, 0) + len(inst.notes)
+        target = chosen if lo <= inst.program < hi else rest
+        target += [amt.Note(n.start, n.end, n.pitch, n.velocity / 127) for n in inst.notes]
+    return sorted(chosen, key=lambda n: n.start), sorted(rest, key=lambda n: n.start), labels
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio")
@@ -257,6 +284,10 @@ def main():
     ap.add_argument("--fmax", type=float, default=4200.0)
     ap.add_argument("--onset", type=float, default=0.5)
     ap.add_argument("--min-ms", type=float, default=58.0, help="shortest note to keep")
+    ap.add_argument("--notes-from", default=None, help="take the notes from this MIDI file (for example one written by scripts/run_yourmt3.py) instead of running the built-in detector")
+    ap.add_argument("--join-held", action="store_true", help="with --notes-from: also join a held note written twice (off by default; it cost 2 points of notes found on both recordings that have an answer key)")
+    ap.add_argument("--lowest", default=None, help="lowest note these instruments can play, e.g. G3 for violins; anything below it cannot be theirs and goes to the accompaniment")
+    ap.add_argument("--family", default="strings", choices=sorted(FAMILIES), help="which instrument family in that MIDI file holds the two lines to split")
     ap.add_argument("--no-stereo", action="store_true", help="ignore left/right position even when the recording is stereo")
     ap.add_argument("--check-overtones", action="store_true", help="remove notes the recording says are only an overtone of a lower note (for pieces with piano)")
     ap.add_argument("--keep-rewrites", action="store_true", help="do not join a held note that the detector wrote twice")
@@ -271,14 +302,34 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     y = amt.load_mono(args.audio)
-    raw = amt.poly_notes(args.audio, fmin=args.fmin, fmax=args.fmax, onset=args.onset, frame=args.frame, min_ms=args.min_ms)
-    notes = drop_overtone_ghosts(raw) if args.drop_overtones else list(raw)
-    if not args.keep_rewrites:
-        notes = amt.merge_held(notes, y)
-    if args.check_overtones:
-        notes = amt.drop_checked_overtones(notes, y)
-    if args.drop_blips:
-        notes = drop_blips(notes)
+    accompaniment = []
+    if args.notes_from:
+        # An instrument-aware model has already said which notes belong to which instrument.
+        # Its notes are used as they are: on the two-violin benchmark the held-note check took
+        # 2.3 points off the notes found for half a point of accuracy, so it is not applied.
+        raw, accompaniment, labels = notes_from_midi(args.notes_from, args.family)
+        notes = list(raw)
+        source = {"notes_from": Path(args.notes_from).name, "family": args.family, "tracks_in_file": labels}
+        if args.lowest:
+            floor = note_number(args.lowest)
+            below = [n for n in notes if n.pitch < floor]
+            notes = [n for n in notes if n.pitch >= floor]
+            accompaniment = sorted(accompaniment + below, key=lambda n: n.start)
+            source["below_%s_moved_to_accompaniment" % args.lowest] = len(below)
+        if args.join_held:
+            before = len(notes)
+            notes = amt.merge_held(notes, y)
+            source["held_notes_joined"] = before - len(notes)
+    else:
+        raw = amt.poly_notes(args.audio, fmin=args.fmin, fmax=args.fmax, onset=args.onset, frame=args.frame, min_ms=args.min_ms)
+        notes = drop_overtone_ghosts(raw) if args.drop_overtones else list(raw)
+        if not args.keep_rewrites:
+            notes = amt.merge_held(notes, y)
+        if args.check_overtones:
+            notes = amt.drop_checked_overtones(notes, y)
+        if args.drop_blips:
+            notes = drop_blips(notes)
+        source = {"notes_from": "built-in detector"}
     A, B, stereo = split_parts(notes, args.audio, roles=args.roles, use_stereo=not args.no_stereo)
     for span in filter(None, "" if args.roles else args.solo.split(",")):  # a hint from someone who knows the piece
         lo, hi = (float(x) for x in span.split("-"))
@@ -296,13 +347,17 @@ def main():
     if not args.roles and np.mean([n.pitch for n in A] or [0]) < np.mean([n.pitch for n in B] or [0]):
         A, B = B, A
     names = ("Sustained line", "Moving line") if args.roles else ("Violin 1", "Violin 2")
-    disputed = None if args.roles else tone_disputes(y, A, B)
+    # the tone check was validated against the pitch-based split; after a split by side it
+    # disagrees with nearly half the notes and tells you nothing, so it is skipped there
+    disputed = None if args.roles or stereo.get("split_by") == "left/right position" else tone_disputes(y, A, B)
     for n in A + B:
         n.conf = 0.0 if disputed and id(n) in disputed else 1.0
     beats, bpm, jitter = amt.beat_grid(y)
     n_cross, frac_inverted, frac_both = crossings(A, B)
 
     report = {
+        "note_source": source,
+        "accompaniment_notes": len(accompaniment),
         "notes_raw": len(raw),
         "notes_after_joining_held_notes": len(notes),
         "part1_notes": len(A),
@@ -332,10 +387,15 @@ def main():
     sf.write(str(out / "check_parts.wav"), np.stack([pa, pb], axis=1) / peak * 0.7, amt.SR)  # part 1 left, part 2 right
 
     # real-time MIDI keeps the performance timing; the gridded copy is for notation
-    amt.write_midi(out / "duet_performance.mid", [(names[0], 40, A), (names[1], 40, B)], bpm)
+    extra = [("Accompaniment (as labelled by the model)", 0, accompaniment)] if accompaniment else []
+    amt.write_midi(out / "duet_performance.mid", [(names[0], 40, A), (names[1], 40, B)] + extra, bpm)
     gA, gB = amt.warp(A, beats, bpm, grid=4), amt.warp(B, beats, bpm, grid=4)
-    amt.write_midi(out / "duet_gridded.mid", [(names[0], 40, gA), (names[1], 40, gB)], bpm)
-    amt.write_musicxml(out / "duet.musicxml", [(names[0], "treble", gA), (names[1], "treble", gB)], bpm, unsure_below=0.5, unsure_style="color")
+    gAcc = amt.warp(accompaniment, beats, bpm, grid=4)
+    amt.write_midi(out / "duet_gridded.mid", [(names[0], 40, gA), (names[1], 40, gB)] + ([("Accompaniment (as labelled by the model)", 0, gAcc)] if gAcc else []), bpm)
+    staves = [(names[0], "treble", gA), (names[1], "treble", gB)]
+    if gAcc:  # a keyboard part on two staves, divided at middle C
+        staves += [("Accompaniment, upper staff", "treble", [n for n in gAcc if n.pitch >= 60]), ("Accompaniment, lower staff", "bass", [n for n in gAcc if n.pitch < 60])]
+    amt.write_musicxml(out / "duet.musicxml", staves, bpm, unsure_below=0.5, unsure_style="color")
 
 
 if __name__ == "__main__":

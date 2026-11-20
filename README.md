@@ -19,6 +19,27 @@ The duet path is scored against nine two-violin recordings from the [URMP datase
 
 The detector tends to write one held note as two or three, and on these pieces a back-to-back pair of the same pitch is a real repeated note about as often as it is a continuation, so merging them blindly costs 17 points of notes found. The recording settles it instead: at a real attack the level of that pitch jumps by a median of 6.8 dB and dips by 6.3 dB first, against 1.9 and -0.1 for a continuation, and a note is joined to the one before it only when neither shows. That check took the share of written notes that are real from 74.7% to 88.1% for 2.4 points of notes found; its two thresholds were chosen on half of the pieces, so part of that gain is in-sample (the held-out halves gave 13 and 15 points). What remains among the extra notes is mostly overtones an octave or a twelfth above a real note.
 
+## A model that names the instrument
+
+The built-in detector writes notes without saying what played them, which is why a piano swamps the violin parts. [YourMT3+](https://github.com/mimbres/YourMT3) (Chang et al., 2024; Apache-2.0, open weights) is a transcription model trained across many instrumentations that writes one track per instrument, and `scripts/run_yourmt3.py` runs it so that `scripts/duet.py --notes-from` can take its strings track as the notes to divide between the two players, carrying everything else along as an accompaniment part.
+
+| | Built-in detector | YourMT3+ |
+|---|---|---|
+| Two violins and piano, checked against the score: share of violin-part notes that are violin notes | 18% | **61%** |
+| Same piece: violin notes found, above the chance level | 43 points | 47 points |
+| Same piece: violin notes placed in the right part, after the split by side | 83% | **86.5%** |
+| Two-violin benchmark: written notes that are real | 87.5% | **96.8%** |
+| Two-violin benchmark: upper note found when the violins play in octaves | 73.9% | 86.3% |
+
+The benchmark row flatters the model, since URMP is among the data it was trained on; the piece with piano is one it had never seen, and is the fairer evidence. It still missed about four violin notes in ten there, it puts both violins on a single strings track (so the split remains this project's job), and on a reverberant two-violin recording with no answer key about half of its notes were the same pitch written again, most of them without a fresh attack in the audio, with 152 notes credited to a piano and a saxophone that were not there. `--join-held` applies the held-note check to its notes; it is off by default because it cost about two points of notes found on both recordings that have an answer key. `--lowest G3` moves anything below the instruments' range out of their parts.
+
+```bash
+.venv_mt3/bin/python scripts/run_yourmt3.py recording.wav out/my_piece/model.mid
+python -I scripts/duet.py recording.wav out/my_piece --notes-from out/my_piece/model.mid --lowest G3
+```
+
+The model's code and checkpoint are not part of this repository: they go under `tools/yourmt3/`, with their own environment in `.venv_mt3`.
+
 ## Where it falls short
 
 Telling the two players apart is the weak point, and what helps depends on the recording. In mono, nothing in the pitches says which violin is playing when one of them plays alone: on a piece with a full score to check against, the two violins' solo passages sat in practically the same range, and the best possible pitch cut-off placed 57% of those notes correctly. A stereo recording can carry the answer in where each player sits. When the notes of a recording are spread widely between left and right, the parts are divided by side instead, which on that piece (two violins about 7 dB apart, with piano) placed 83% of violin notes in the right part against 62% for pitch movement; mixing the two kinds of evidence did worse than position alone, because the piano's notes pull the pitch-based logic around. The spread that triggers this was set from three recordings and `--no-stereo` turns it off. For mono recordings a `--solo` hint for passages you know are one player, and a `--roles` mode that divides the music into a sustained line and a moving line, are the workarounds; the roles mode suits pieces where each player keeps a role for a whole phrase and scored worse than the plain split on the piece above, where the pattern changes almost every bar.
@@ -77,6 +98,7 @@ The duet tool also asks a question that does not depend on pitch movement: which
 - `scripts/amt.py` holds the shared pieces: pitch tracking and note cutting for single lines, the multi-note detector, beat grid, chords, drums, MIDI and MusicXML export.
 - `scripts/pop.py` and `scripts/run_pop.sh` are the pop path.
 - `scripts/duet.py` is the two-instrument path, including the part splitter.
+- `scripts/run_yourmt3.py` runs the instrument-aware model whose output `duet.py` can take in place of its own detector.
 - `scripts/eval_urmp.py` and `scripts/eval_score.py` are the two checkers.
 - `scripts/build_score_dataset.sh`, `scripts/helper_barlines.py`, `scripts/omr_stitch.py` and `scripts/align_dataset.py` are the sheet-music path.
 - `scripts/tone_experiment.py` is the tone experiment behind the second opinion, `scripts/rearticulation_experiment.py` the one behind the held-note check, and `scripts/instrument_experiment.py` an attempt to tell struck notes from bowed ones that did not work well enough to use (69% against 59% for guessing).

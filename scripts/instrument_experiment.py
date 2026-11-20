@@ -65,14 +65,17 @@ def main():
         truth[kind] += [(float(warp(s)), p) for s, _, p in notes]
     S = np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=HOP))
     freqs = librosa.fft_frequencies(sr=amt.SR, n_fft=N_FFT)
-    det = [n for n in amt.poly_notes(audio, fmin=185.0, fmax=4200.0, min_ms=58) if lo <= n.start <= hi]
+    det = amt.merge_held(amt.poly_notes(audio, fmin=185.0, fmax=4200.0, min_ms=58), y)
+    det = [n for n in det if lo <= n.start <= hi]
+    pans = amt.pan_per_note(audio, det)
+    centre = float(np.median(pans)) if pans is not None else 0.0
 
     def near(kind, n, tol=0.3):
         return any(p == n.pitch and abs(t - n.start) <= tol for t, p in truth[kind])
 
     X, lab, when = [], [], []
     tally = {"violin only": 0, "piano only": 0, "both": 0, "neither": 0}
-    for n in det:
+    for i, n in enumerate(det):
         v, p = near("violin", n), near("piano", n)
         tally["both" if v and p else "violin only" if v else "piano only" if p else "neither"] += 1
         if v == p:
@@ -80,30 +83,33 @@ def main():
         f = note_features(S, freqs, n)
         if f is None:
             continue
-        X.append(f)
+        pan = pans[i] if pans is not None else 0.0
+        X.append(f + [pan, abs(pan - centre), float(n.pitch)])
         lab.append(1 if v else 0)
         when.append(n.start)
     X, lab, when = np.array(X), np.array(lab), np.array(when)
+    names = FEATURES + ["right_minus_left_db", "distance_from_centre_db", "pitch"]
     print("detected notes in the scored span: %d | %s" % (len(det), tally))
-    print("usable labelled notes: %d violin, %d piano" % (lab.sum(), (1 - lab).sum()))
+    print("usable labelled notes: %d violin, %d piano | centre of the stereo image %+.1f dB" % (lab.sum(), (1 - lab).sum(), centre))
     cut = np.median(when)
     tr, te = when < cut, when >= cut
-    print("\nfeature               violin median   piano median   one-feature accuracy on the later half")
-    for j, name in enumerate(FEATURES):
-        best = (0, 0, 1)
-        for thr in np.percentile(X[tr, j], np.arange(5, 96, 5)):
-            for sign in (1, -1):
-                acc = (((X[tr, j] - thr) * sign > 0).astype(int) == lab[tr]).mean()
-                best = max(best, (acc, thr, sign))
-        _, thr, sign = best
-        acc = (((X[te, j] - thr) * sign > 0).astype(int) == lab[te]).mean()
-        print("%-20s %12.2f %14.2f %12.1f%%   (violin if %s %.2f)" % (name, np.median(X[lab == 1, j]), np.median(X[lab == 0, j]), 100 * acc, ">" if sign > 0 else "<", thr))
-    clf = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, class_weight="balanced")).fit(X[tr], lab[tr])
-    pred = clf.predict(X[te])
-    print("\nall five together, trained on the earlier half, tested on the later half (%d notes):" % te.sum())
-    print("  right overall %.1f%% | violin notes kept %.1f%% | piano notes removed %.1f%%" % (100 * (pred == lab[te]).mean(), 100 * pred[lab[te] == 1].mean(), 100 * (1 - pred[lab[te] == 0]).mean()))
-    print("  always guessing the commoner class would score %.1f%%" % (100 * max(lab[te].mean(), 1 - lab[te].mean())))
-    (d / "instrument_experiment.json").write_text(json.dumps({"tally": tally, "features": FEATURES, "test_accuracy": float((pred == lab[te]).mean())}, indent=1))
+    print("always guessing the commoner class on the later half: %.1f%%" % (100 * max(lab[te].mean(), 1 - lab[te].mean())))
+    print("\nfeature                    violin median   piano median")
+    for j, name in enumerate(names):
+        print("%-26s %12.2f %14.2f" % (name, np.median(X[lab == 1, j]), np.median(X[lab == 0, j])))
+    results = {}
+    sets = {"struck or bowed (5 features)": [0, 1, 2, 3, 4], "position only": [5, 6], "pitch only": [7], "struck or bowed + position": [0, 1, 2, 3, 4, 5, 6], "all eight": list(range(8))}
+    print("\ntrained on the earlier half, tested on the later half (%d notes):" % te.sum())
+    from sklearn.ensemble import GradientBoostingClassifier
+
+    for label, cols in sets.items():
+        clf = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, class_weight="balanced")).fit(X[tr][:, cols], lab[tr])
+        pred = clf.predict(X[te][:, cols])
+        gb = GradientBoostingClassifier(n_estimators=150, max_depth=3, learning_rate=0.05, subsample=0.8, random_state=0).fit(X[tr][:, cols], lab[tr])
+        pg = gb.predict(X[te][:, cols])
+        results[label] = float((pred == lab[te]).mean())
+        print("  %-30s straight-line model %.1f%% (violin kept %.0f%%, piano removed %.0f%%) | tree model %.1f%% (kept %.0f%%, removed %.0f%%)" % (label, 100 * (pred == lab[te]).mean(), 100 * pred[lab[te] == 1].mean(), 100 * (1 - pred[lab[te] == 0]).mean(), 100 * (pg == lab[te]).mean(), 100 * pg[lab[te] == 1].mean(), 100 * (1 - pg[lab[te] == 0]).mean()))
+    (d / "instrument_experiment.json").write_text(json.dumps({"tally": tally, "features": names, "test_accuracy": results}, indent=1))
 
 
 if __name__ == "__main__":
