@@ -58,12 +58,28 @@ Every run writes `check_*.wav` files with the recording in the left ear and the 
 
 `scripts/eval_urmp.py` reproduces the table above (the `leap_filter` variant is the default pipeline) from a local copy of the URMP pieces that contain two violins, and reports the same figures broken down by note length, loudness and interval, which is how each setting was chosen. `scripts/eval_score.py` compares a transcription with sheet music in MusicXML or MIDI by stretching the score onto the recording's timing; its alignment lands within 150 ms of the annotated onset for only 70 to 88% of notes on three benchmark pieces, so treat its numbers as a lower bound until that improves.
 
+## Turning sheet music into a dataset
+
+When a score exists, it is a better reference than any annotation made by ear, so there is a path from page images to a table of notes. `scripts/build_score_dataset.sh` takes a PDF or a folder of page images, reads each page with the [oemer](https://github.com/BreezeWhite/oemer) score reader, joins the pages into one score with a named part per staff, and, given a recording, places every note on that recording's clock.
+
+```bash
+scripts/build_score_dataset.sh score.pdf my_piece --layout "Violin 1,Violin 2,Piano,Piano" --audio recording.wav
+```
+
+Each piece ends up in `datasets/my_piece/` as the page images, the reader's output per page, a `score.mid`, a `notes_score.csv` (part, measure, beat, duration, pitch) and a `notes_aligned.csv` (part, start, end, pitch), the last in the same shape as the URMP annotations. The reader runs in its own environment (`.venv_omr`) because it needs older versions of NumPy and OpenCV than the rest. Rhythms are the weak part of what it reads, with roughly six bars in ten adding up to a full measure on a clean engraving, and nothing is hand-checked, so treat the result as a draft reference until someone has looked it over.
+
+## A second opinion on who is playing
+
+The duet tool also asks a question that does not depend on pitch movement: which violin does this note sound like? It learns each instrument's tone from the passages where both play at once, with no labels, and compares that opinion with the split. On the benchmark the split is right for 90% of notes where the two opinions agree and 71% where they disagree, so disagreements are coloured red in the MusicXML as the places to check by ear first. Using tone to overrule the split, rather than to flag it, did not help: 88.6% against 88.8% without it (`scripts/tone_experiment.py`).
+
 ## What is in here
 
 - `scripts/amt.py` holds the shared pieces: pitch tracking and note cutting for single lines, the multi-note detector, beat grid, chords, drums, MIDI and MusicXML export.
 - `scripts/pop.py` and `scripts/run_pop.sh` are the pop path.
 - `scripts/duet.py` is the two-instrument path, including the part splitter.
 - `scripts/eval_urmp.py` and `scripts/eval_score.py` are the two checkers.
+- `scripts/build_score_dataset.sh`, `scripts/omr_stitch.py` and `scripts/align_dataset.py` are the sheet-music path.
+- `scripts/tone_experiment.py` is the tone experiment behind the second opinion.
 - `scripts/plot_line.py` and `scripts/probe_stereo.py` are small diagnostics.
 
-No audio, stems or transcriptions of commercial recordings are included.
+No audio, stems, scores or transcriptions of commercial recordings are included.

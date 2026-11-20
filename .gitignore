@@ -4,3 +4,4 @@ audio/
 out/
 __pycache__/
 *.pyc
+datasets/
