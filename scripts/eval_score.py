@@ -115,6 +115,8 @@ def main():
     ap.add_argument("--tol", type=float, default=0.3)
     ap.add_argument("--min-ms", type=float, default=58.0)
     ap.add_argument("--partial", action="store_true", help="the score covers only part of the recording")
+    ap.add_argument("--check-overtones", action="store_true", help="remove notes the recording says are only an overtone of a lower note")
+    ap.add_argument("--no-stereo", action="store_true", help="ignore left/right position even when the recording is stereo")
     ap.add_argument("--keep-rewrites", action="store_true", help="do not join a held note that the detector wrote twice")
     args = ap.parse_args()
     out = Path(args.out)
@@ -137,7 +139,9 @@ def main():
     raw = amt.poly_notes(args.audio, fmin=185.0, fmax=4200.0, min_ms=args.min_ms)
     if not args.keep_rewrites:
         raw = amt.merge_held(raw, y)
-    A, B = duet.split_two_voices(list(raw))
+    if args.check_overtones:
+        raw = amt.drop_checked_overtones(raw, y)
+    A, B, how = duet.split_parts(list(raw), args.audio, use_stereo=not args.no_stereo)
     A, B = duet.trim_tails(A), duet.trim_tails(B)
     A = [n for n in A if lo - args.tol <= n.start <= hi + args.tol]  # judge only where the score reaches
     B = [n for n in B if lo - args.tol <= n.start <= hi + args.tol]
@@ -152,6 +156,7 @@ def main():
     high_blips = sum(1 for n in extra if n.dur < 0.15 and n.pitch >= 84)
     in_range = [g for g in truth if g["pitch"] >= 55]
     report = {
+        "how_parts_were_split": how,
         "alignment_cost": cost,
         "recording_seconds_covered_by_score": [round(lo, 1), round(hi, 1)],
         "recording_length_sec": round(len(y) / amt.SR, 1),

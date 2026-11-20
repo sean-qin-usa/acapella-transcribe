@@ -93,7 +93,7 @@ def effective_durations(notes, gap=0.05):
         n.eff = n.eff or n.dur
 
 
-def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=0.0, role_split=0.45, tone=None, tone_w=0.0):
+def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=0.0, role_split=0.45, tone=None, tone_w=0.0, register_w=4.0):
     """Beam search over assignments: each part should move by small steps and rarely play two notes at once.
 
     idle   extra cost for handing a note to the part that is resting while the other part is the
@@ -101,6 +101,7 @@ def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=
     dur_w  cost per doubling/halving of note length relative to the part's previous note
            (keeps a run of short notes together and a sustained line together)
     ring_ok  treat an overlap as a second string only if it also covers half of the new note
+    register_w  cost, in semitones, of giving the higher of two sounding notes to the lower part
     tone     optional {id(note): (cost if player 0, cost if player 1)} from a tone classifier;
              with it part A is player 0 and part B is player 1
     role_w   split by role instead of by player: part A is the sustained line and part B the
@@ -142,7 +143,7 @@ def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=
                 # mild preference for not swapping registers while both parts sound
                 if other is not None and other.end > n.start + 0.04:
                     upper_is_a = (n.pitch > other.pitch) == (v == 0)
-                    c += 0.0 if upper_is_a else 1.0
+                    c += 0.0 if upper_is_a else register_w
                 key = (id(pa), id(pb))
                 if key not in nxt or c < nxt[key][0]:
                     nxt[key] = (c, pa, pb, lab + (v,))
@@ -170,6 +171,36 @@ def trim_tails(part, same_onset=0.05, tail=0.15):
                     n.end = m.start
                 break
     return [n for n in part if n.dur >= 0.06]
+
+
+def split_parts(notes, audio_path, roles=False, use_stereo=True, min_spread_db=5.0):
+    """Divide the notes into two parts, choosing the evidence that suits the recording.
+
+    A stereo recording whose notes are spread widely between left and right is split by side:
+    each note goes to the part on its side of the recording's centre. On the test piece (two
+    violins and piano, the violins about 7 dB apart) that put 83% of violin notes in the right
+    part, where pitch movement managed 62% and any mixture of the two did worse, because the
+    piano's notes pull the pitch-based logic around. One source alone spreads over roughly
+    3-4 dB, so a spread of `min_spread_db` or more is taken to mean sources at different
+    places; that bar comes from three recordings and is a starting point.
+
+    Otherwise (mono, or a narrow stereo image) the split is by pitch movement and register.
+    Returns (part A, part B, what was used)."""
+    if roles:
+        A, B = split_two_voices(notes, role_w=3.0)
+        return A, B, {"split_by": "sustained line / moving line"}
+    pans = amt.pan_per_note(audio_path, notes) if use_stereo else None
+    if pans is not None and len(notes) >= 40:
+        spread = float(np.percentile(pans, 75) - np.percentile(pans, 25))
+        centre = float(np.median(pans))
+        if spread >= min_spread_db:
+            A = [n for n, p in zip(notes, pans) if p < centre]
+            B = [n for n, p in zip(notes, pans) if p >= centre]
+            return A, B, {"split_by": "left/right position", "spread_db": round(spread, 1), "centre_db": round(centre, 1)}
+        A, B = split_two_voices(notes)
+        return A, B, {"split_by": "pitch movement and register", "stereo_spread_db": round(spread, 1), "why": "stereo image too narrow to separate players"}
+    A, B = split_two_voices(notes)
+    return A, B, {"split_by": "pitch movement and register", "why": "mono recording" if use_stereo else "left/right position switched off"}
 
 
 def tone_disputes(y, A, B):
@@ -226,6 +257,8 @@ def main():
     ap.add_argument("--fmax", type=float, default=4200.0)
     ap.add_argument("--onset", type=float, default=0.5)
     ap.add_argument("--min-ms", type=float, default=58.0, help="shortest note to keep")
+    ap.add_argument("--no-stereo", action="store_true", help="ignore left/right position even when the recording is stereo")
+    ap.add_argument("--check-overtones", action="store_true", help="remove notes the recording says are only an overtone of a lower note (for pieces with piano)")
     ap.add_argument("--keep-rewrites", action="store_true", help="do not join a held note that the detector wrote twice")
     ap.add_argument("--solo", default="", help="time ranges where only one violin plays, e.g. 0-13,95-102 (seconds)")
     ap.add_argument("--roles", action="store_true", help="split into a sustained line and a moving line instead of guessing which player is which")
@@ -242,9 +275,11 @@ def main():
     notes = drop_overtone_ghosts(raw) if args.drop_overtones else list(raw)
     if not args.keep_rewrites:
         notes = amt.merge_held(notes, y)
+    if args.check_overtones:
+        notes = amt.drop_checked_overtones(notes, y)
     if args.drop_blips:
         notes = drop_blips(notes)
-    A, B = split_two_voices(notes, role_w=3.0) if args.roles else split_two_voices(notes)
+    A, B, stereo = split_parts(notes, args.audio, roles=args.roles, use_stereo=not args.no_stereo)
     for span in filter(None, "" if args.roles else args.solo.split(",")):  # a hint from someone who knows the piece
         lo, hi = (float(x) for x in span.split("-"))
         inA = [n for n in A if lo <= n.start < hi]
@@ -281,6 +316,7 @@ def main():
         "part_crossings": n_cross,
         "share_of_duet_time_part2_above_part1": frac_inverted,
         "chroma_agreement_with_audio": amt.chroma_agreement(A + B, y),
+        "how_parts_were_split": stereo,
         "notes_where_tone_disputes_the_split": None if disputed is None else len(disputed) / max(len(A) + len(B), 1),
         "tempo_bpm": bpm,
         "beat_jitter": jitter,

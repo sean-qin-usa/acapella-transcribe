@@ -332,6 +332,131 @@ def merge_held(notes, y, rise_min=4.2, dip_min=4.0, gap=0.08, sr=SR):
     return out
 
 
+# ---------------------------------------------------------------- overtones written as notes
+OVERTONE_STEPS = {12: 2, 19: 3, 24: 4, 28: 5}  # semitones above -> which partial of the lower note
+
+
+def overtone_spectrogram(y, sr=SR):
+    hop = 256
+    return np.abs(librosa.stft(y, n_fft=4096, hop_length=hop)), librosa.fft_frequencies(sr=sr, n_fft=4096), hop
+
+
+def overtone_candidates(notes):
+    """(note, lower note, partial number) for each note that sits on an overtone of another
+    note sounding for at least half of its length. The loudest such lower note is used."""
+    out = []
+    by_start = sorted(notes, key=lambda n: n.start)
+    for n in by_start:
+        best = None
+        for m in by_start:
+            if m.start > n.end:
+                break
+            ratio = OVERTONE_STEPS.get(n.pitch - m.pitch)
+            if ratio and min(m.end, n.end) - max(m.start, n.start) > 0.5 * n.dur:
+                if best is None or m.amp > best[0].amp:
+                    best = (m, ratio)
+        if best:
+            out.append((n, best[0], best[1]))
+    return out
+
+
+def _partial_db(S, freqs, f, a, b):
+    m = (freqs > f * 0.97) & (freqs < f * 1.03)
+    if not m.sum() or b <= a:
+        return None
+    return 10 * np.log10((S[m, a:b] ** 2).sum(axis=0).mean() + 1e-10)
+
+
+def overtone_features(S, freqs, hop, n, parent, ratio, sr=SR):
+    """[stickout, amp ratio, onset lateness, length ratio, own rise] for one candidate."""
+    f0 = 440.0 * 2 ** ((parent.pitch - 69) / 12)
+    a, b = int(max(n.start, parent.start) * sr / hop), int(min(n.end, parent.end) * sr / hop)
+    if b - a < 3:
+        return None
+    stick = []
+    for k in range(ratio, 13, ratio):  # the lower note's partials that the candidate shares
+        if f0 * (k + 1) > 9000:
+            break
+        here = _partial_db(S, freqs, f0 * k, a, b)
+        side = [_partial_db(S, freqs, f0 * j, a, b) for j in (k - 1, k + 1) if j >= 1]
+        side = [x for x in side if x is not None]
+        if here is not None and side:
+            stick.append(here - float(np.mean(side)))
+    if not stick:
+        return None
+    c = int(n.start * sr / hop)
+    lo, hi = max(c - 6, 0), min(c + 8, S.shape[1] - 1)
+    if hi - lo < 4:
+        return None
+
+    def rise(ks):
+        e = np.zeros(hi - lo)
+        for k in ks:
+            m = (freqs > f0 * k * 0.97) & (freqs < f0 * k * 1.03)
+            if m.sum() and f0 * k < 9000:
+                e += (S[m, lo:hi] ** 2).sum(axis=0)
+        t = 10 * np.log10(e + 1e-10)
+        return float(np.max(t[2:] - t[:-2]))
+
+    shared = [k for k in range(ratio, 13, ratio)]
+    others = [k for k in range(1, 13) if k % ratio]
+    return [float(np.mean(stick)), n.amp / max(parent.amp, 1e-6), n.start - parent.start, n.dur / max(parent.dur, 1e-6), rise(shared) - rise(others)]
+
+
+# Fitted on 356 candidates from the URMP two-violin pieces (scripts/overtone_experiment.py):
+# a logistic model on the five features above, with the cut-off set to keep 95% of real notes.
+_OT_MEAN = np.array([8.4434, 0.7354, 0.1642, 0.6069, 1.2447])
+_OT_SCALE = np.array([5.1661, 0.3004, 0.3334, 0.4061, 2.709])
+_OT_COEF = np.array([1.9981, 1.3242, 0.4875, 0.6039, -0.3447])
+_OT_INTERCEPT, _OT_CUT = 0.9770, 0.195
+
+
+def drop_checked_overtones(notes, y):
+    """Remove notes the recording says are only an overtone of a lower note.
+
+    Held out on the benchmark this keeps about 91% of real upper notes and catches 65-77% of
+    overtones, which on two violins costs about five points on the upper note of an octave for
+    two points of accuracy: not worth it there. With a piano in the mix it removed 143 notes
+    on the test piece, 112 of which matched nothing in the score and 11 of which were violin
+    notes, so it is offered as an option for accompanied pieces."""
+    S, freqs, hop = overtone_spectrogram(y)
+    drop = set()
+    for n, parent, ratio in overtone_candidates(notes):
+        f = overtone_features(S, freqs, hop, n, parent, ratio)
+        if f is None:
+            continue
+        z = float(((np.array(f) - _OT_MEAN) / _OT_SCALE) @ _OT_COEF + _OT_INTERCEPT)
+        if 1.0 / (1.0 + np.exp(-z)) < _OT_CUT:
+            drop.add(id(n))
+    return [n for n in notes if id(n) not in drop]
+
+
+# ---------------------------------------------------------------- left/right position
+def pan_per_note(path, notes, sr=SR):
+    """Right-minus-left level in dB at each note's first four harmonics, or None when the
+    recording is mono (or its two channels are the same signal)."""
+    import soundfile as sf
+
+    st, file_sr = sf.read(str(path), always_2d=True)
+    if st.shape[1] < 2 or np.corrcoef(st[:, 0], st[:, 1])[0, 1] > 0.98:
+        return None
+    hop = 512
+    chans = [np.abs(librosa.stft(librosa.resample(st[:, c].astype(np.float32), orig_sr=file_sr, target_sr=sr), n_fft=4096, hop_length=hop)) ** 2 for c in (0, 1)]
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
+    out = []
+    for n in notes:
+        a = int(n.start * sr / hop)
+        b = max(int(n.end * sr / hop), a + 2)
+        f0 = 440.0 * 2 ** ((n.pitch - 69) / 12)
+        e = [0.0, 0.0]
+        for k in (1, 2, 3, 4):
+            m = (freqs > f0 * k * 0.97) & (freqs < f0 * k * 1.03)
+            for c in (0, 1):
+                e[c] += float(chans[c][m, a:b].sum())
+        out.append(10 * np.log10((e[1] + 1e-12) / (e[0] + 1e-12)))
+    return out
+
+
 # ---------------------------------------------------------------- rhythm grid
 def beat_grid(y, sr=SR, start_bpm=90):
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=512, start_bpm=start_bpm, units="time")
