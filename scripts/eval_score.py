@@ -72,6 +72,11 @@ def align(score_notes, y, sr=amt.SR, onset_w=0.0, smooth=0, partial=False):
     The returned function has a .span attribute: the (start, end) seconds of the recording
     that the score was matched to.
     """
+    # The path may bend the tempo by at most a factor of two either way, so the score is first
+    # stretched to the recording's overall length; otherwise a movement played at half the
+    # score file's nominal tempo cannot be aligned at all.
+    scale = 1.0 if partial else (len(y) / sr) / max(e for _, e, _ in score_notes)
+    score_notes = [(s0 * scale, e0 * scale, p0) for s0, e0, p0 in score_notes]
     end = max(e for _, e, _ in score_notes)
     n_s = int(end * sr / HOP) + 1
     S = roll_chroma(score_notes, n_s)
@@ -100,7 +105,56 @@ def align(score_notes, y, sr=amt.SR, onset_w=0.0, smooth=0, partial=False):
         at = np.maximum.accumulate(ndi.median_filter(at - trend, size=smooth, mode="nearest") + trend)
 
     def warp(t):
-        return np.interp(t, st, at)
+        return np.interp(np.asarray(t) * scale, st, at)
+
+    warp.span = (float(at[0]), float(at[-1]))
+    return warp, cost
+
+
+def _note_roll(notes, n_frames, sr=amt.SR, lo=28, hi=104):
+    """Frames x pitches picture of a set of notes: a strong mark where each note starts (so
+    timing is sharp), a faint one while it lasts, and a faint copy folded to one octave (so a
+    note written an octave off still helps)."""
+    R = np.zeros((hi - lo + 12, n_frames), dtype=np.float32)
+    for s0, e0, p0 in notes:
+        if not lo <= p0 < hi:
+            continue
+        a = min(int(s0 * sr / HOP), n_frames - 1)
+        b = min(max(int(e0 * sr / HOP), a + 1), n_frames)
+        R[p0 - lo, a:b] += 0.25
+        R[p0 - lo, max(a - 1, 0) : min(a + 2, n_frames)] += 1.0
+        R[hi - lo + p0 % 12, a:b] += 0.15
+    return R
+
+
+def align_to_notes(score_notes, heard_notes, length_sec, sr=amt.SR, smooth=5):
+    """Map score time to recording time by matching the score's notes to notes heard in the
+    recording (from any note detector), instead of matching harmony.
+
+    Harmony changes slowly in slow music, so a harmony-based path can slide within a chord;
+    individual note starts pin the timing down. `heard_notes` are (start, end, pitch) in
+    seconds and should come from a detector other than the transcription being judged.
+    Returns (warp function with .span, mean cost)."""
+    scale = length_sec / max(e for _, e, _ in score_notes)
+    scaled = [(s0 * scale, e0 * scale, p0) for s0, e0, p0 in score_notes]
+    n = int(length_sec * sr / HOP) + 1
+    S, A = _note_roll(scaled, n) + 1e-3, _note_roll(heard_notes, n) + 1e-3
+    S /= np.linalg.norm(S, axis=0, keepdims=True)
+    A /= np.linalg.norm(A, axis=0, keepdims=True)
+    D, wp = librosa.sequence.dtw(X=S, Y=A, metric="euclidean", step_sizes_sigma=np.array([[1, 1], [1, 2], [2, 1]]))
+    wp = wp[::-1]
+    cost = float(D[wp[-1][0], wp[-1][1]] / len(wp))
+    st, at = wp[:, 0] * HOP / sr, wp[:, 1] * HOP / sr
+    keep = np.r_[True, np.diff(st) > 0]
+    st, at = st[keep], at[keep]
+    if smooth:
+        import scipy.ndimage as ndi
+
+        trend = at[0] + (st - st[0]) * (at[-1] - at[0]) / max(st[-1] - st[0], 1e-9)
+        at = np.maximum.accumulate(ndi.median_filter(at - trend, size=smooth, mode="nearest") + trend)
+
+    def warp(t):
+        return np.interp(np.asarray(t) * scale, st, at)
 
     warp.span = (float(at[0]), float(at[-1]))
     return warp, cost

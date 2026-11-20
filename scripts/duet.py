@@ -245,6 +245,80 @@ def tone_disputes(y, A, B):
     return {id(n) for n, v in zip(notes, vote) if v != part[id(n)]}
 
 
+def split_voices(notes, n_parts, floors=None, register_w=4.0, beam=128, evidence=None, evidence_w=0.0):
+    """Divide notes among `n_parts` players ordered from highest to lowest (a string quartet is
+    violin 1, violin 2, viola, cello). The same evidence as the two-part split, generalised:
+
+      - each part moves by small steps, and a long rest loosens that link;
+      - a part rarely sounds two notes at once;
+      - a part should not sit below a lower part's sounding note or above a higher part's;
+      - `floors`: the lowest note each player's instrument can produce. A note under a part's
+        floor cannot be given to it (instrument knowledge, not knowledge of the piece);
+      - `evidence`: optional {id(note): cost per part} from something independent, such as
+        left/right position.
+
+    Returns a list of n_parts lists of notes."""
+    floors = floors or [0] * n_parts
+
+    def step_cost(prev, n):
+        if prev is None:
+            return 0.0
+        gap = n.start - prev.end
+        cost = 0.0
+        overlap = min(prev.end, n.end) - n.start
+        if overlap > 0.15:
+            cost += 5.0 + 14.0 * overlap / max(n.dur, 0.05)
+        memory = 0.25 + 0.75 * math.exp(-max(gap, 0.0) / 1.5)
+        return cost + abs(n.pitch - prev.pitch) * memory
+
+    states = [(0.0, (None,) * n_parts, ())]
+    for n in sorted(notes, key=lambda x: (x.start, -x.pitch)):
+        nxt = {}
+        for cost, last, lab in states:
+            for v in range(n_parts):
+                if n.pitch < floors[v]:
+                    continue
+                c = cost + step_cost(last[v], n)
+                for j, other in enumerate(last):
+                    if j == v or other is None or other.end <= n.start + 0.04:
+                        continue
+                    if (j > v and n.pitch < other.pitch) or (j < v and n.pitch > other.pitch):
+                        c += register_w  # this would put the parts out of order
+                if evidence is not None and id(n) in evidence:
+                    c += evidence_w * evidence[id(n)][v]
+                new_last = last[:v] + (n,) + last[v + 1 :]
+                key = tuple(id(x) for x in new_last)
+                if key not in nxt or c < nxt[key][0]:
+                    nxt[key] = (c, new_last, lab + (v,))
+        if not nxt:  # below every floor: give it to the lowest part
+            nxt = {i: (cost, last, lab + (n_parts - 1,)) for i, (cost, last, lab) in enumerate(states)}
+        states = sorted(nxt.values(), key=lambda z: z[0])[:beam]
+    order = sorted(notes, key=lambda x: (x.start, -x.pitch))
+    parts = [[] for _ in range(n_parts)]
+    for n, v in zip(order, states[0][2]):
+        parts[v].append(n)
+    return parts
+
+
+def stack_by_pitch(notes, n_parts, floors=None):
+    """Baseline: at each note's start, rank it among the notes sounding then; the highest goes
+    to part 1 and so on down. Knows nothing about lines, only about who is on top right now."""
+    floors = floors or [0] * n_parts
+    parts = [[] for _ in range(n_parts)]
+    for n in notes:
+        sounding = sorted({m.pitch for m in notes if m.start <= n.start + 0.04 and m.end > n.start + 0.04} | {n.pitch}, reverse=True)
+        rank = sounding.index(n.pitch)
+        # count from the bottom when few notes sound, so a lone low note goes to a low part
+        v = min(rank, n_parts - 1) if len(sounding) >= n_parts else None
+        if v is None:
+            ok = [i for i in range(n_parts) if n.pitch >= floors[i]]
+            v = ok[min(rank, len(ok) - 1)] if ok else n_parts - 1
+        while v < n_parts - 1 and n.pitch < floors[v]:
+            v += 1
+        parts[v].append(n)
+    return parts
+
+
 def crossings(A, B, step=0.05):
     end = max(n.end for n in A + B)
     grid = np.arange(0, end, step)
