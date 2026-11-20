@@ -73,6 +73,8 @@ def main():
     share = float(sys.argv[3]) if len(sys.argv) > 3 else 0.4
     tone_w = float(sys.argv[4]) if len(sys.argv) > 4 else 2.0
     rows, pooled = [], dict(n=0, pitch=0, mix=0, stem=0, split=0, fused=0)
+    votes = dict(n=0, agree=0, agree_right=0, split_right_when_disagree=0, move_right=0)
+    selfv = {k: dict(n=0, split_right=0, agree=0, agree_right=0, dis=0, dis_split_right=0) for k in ("all", "alone")}
     for folder in sorted(p for p in root.iterdir() if p.is_dir() and list(p.glob("Notes_1_vn_*.txt"))):
         mix, truth = eval_urmp.load_piece(folder, out / folder.name)
         y = amt.load_mono(mix)
@@ -115,6 +117,40 @@ def main():
         part = {id(n): 0 for n in A} | {id(n): 1 for n in B}
         agree = np.array([part[id(notes[e])] == who[e] for e in idx])
         res["split"] = float(max(agree[te].mean(), 1 - agree[te].mean()))
+        # two independent votes: pitch movement (the splitter) and tone. Name the splitter's parts
+        # from the training stretch, as a user labelling a known passage would.
+        flip = agree[tr].mean() < 0.5
+        vote_move = np.array([part[id(notes[e])] ^ int(flip) for e in idx])[te]
+        vote_tone = clf.predict(Xall)[te]
+        same = vote_move == vote_tone
+        votes["n"] += len(same)
+        votes["agree"] += int(same.sum())
+        votes["agree_right"] += int((vote_move[same] == lab[te][same]).sum())
+        votes["split_right_when_disagree"] += int((vote_move[~same] == lab[te][~same]).sum())
+        votes["move_right"] += int((vote_move == lab[te]).sum())
+        # no labels at all: learn tone from the notes where the split is safest (both violins
+        # sounding at once), using the splitter's own answer as the label, then vote everywhere
+        other_part = {0: B, 1: A}
+
+        def both_sounding(n):
+            return any(min(o.end, n.end) - max(o.start, n.start) > 0.5 * n.dur for o in other_part[part[id(n)]])
+
+        safe = np.array([both_sounding(notes[e]) for e in idx])
+        plab = np.array([part[id(notes[e])] for e in idx])
+        if safe.sum() >= 40 and len(set(plab[safe])) == 2 and (~safe).sum() >= 10:
+            Xs, m2 = fill(X_mix[safe])
+            clf2 = make_pipeline(StandardScaler(), LogisticRegression(C=0.3, max_iter=2000)).fit(Xs, plab[safe])
+            tone2 = clf2.predict(fill(X_mix, m2)[0])
+            truth_part = lab ^ int(agree.mean() < 0.5)  # truth expressed in the splitter's part names
+            for name, mask in (("all", np.ones(len(idx), bool)), ("alone", ~safe)):
+                same2 = (tone2 == plab) & mask
+                diff2 = (tone2 != plab) & mask
+                selfv[name]["n"] += int(mask.sum())
+                selfv[name]["split_right"] += int((plab == truth_part)[mask].sum())
+                selfv[name]["agree"] += int(same2.sum())
+                selfv[name]["agree_right"] += int((plab == truth_part)[same2].sum())
+                selfv[name]["dis"] += int(diff2.sum())
+                selfv[name]["dis_split_right"] += int((plab == truth_part)[diff2].sum())
         evidence = {id(notes[e]): (-logp[i, 0], -logp[i, 1]) for i, e in enumerate(idx)}
         A2, B2 = duet.split_two_voices(list(notes), tone=evidence, tone_w=tone_w)
         part2 = {id(n): 0 for n in A2} | {id(n): 1 for n in B2}
@@ -132,6 +168,18 @@ def main():
     print("  right player from tone on isolated track: %.1f%%" % (100 * tot["stem"]))
     print("  current splitter:                        %.1f%%" % (100 * tot["split"]))
     print("  splitter + tone evidence:                %.1f%%" % (100 * tot["fused"]))
+    dis = votes["n"] - votes["agree"]
+    print("\nTWO VOTES (pitch movement, tone), parts named from the training stretch")
+    print("  pitch movement alone right:        %.1f%%" % (100 * votes["move_right"] / votes["n"]))
+    print("  votes agree on %.1f%% of notes; right when they agree: %.1f%%" % (100 * votes["agree"] / votes["n"], 100 * votes["agree_right"] / max(votes["agree"], 1)))
+    print("  votes disagree on %.1f%% of notes; pitch movement right there: %.1f%%, tone right there: %.1f%%" % (100 * dis / votes["n"], 100 * votes["split_right_when_disagree"] / max(dis, 1), 100 * (1 - votes["split_right_when_disagree"] / max(dis, 1))))
+    print("\nSELF-TAUGHT TONE VOTE (no labels; tone learned where both violins sound together)")
+    for name, label in (("all", "all notes"), ("alone", "notes where one violin plays alone")):
+        v = selfv[name]
+        if v["n"]:
+            print("  %s (%d): splitter right %.1f%% | votes agree on %.1f%%, right there %.1f%% | disagree on %.1f%%, splitter right there %.1f%%" % (label, v["n"], 100 * v["split_right"] / v["n"], 100 * v["agree"] / v["n"], 100 * v["agree_right"] / max(v["agree"], 1), 100 * v["dis"] / v["n"], 100 * v["dis_split_right"] / max(v["dis"], 1)))
+    tot["votes"] = votes
+    tot["self_taught"] = selfv
     (out / "tone_experiment.json").write_text(json.dumps(dict(train_share=share, pooled=tot, pieces=[(n, k, r) for n, k, r in rows]), indent=1))
 
 

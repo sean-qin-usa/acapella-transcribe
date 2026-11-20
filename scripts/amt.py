@@ -420,7 +420,7 @@ def write_midi(path, tracks, bpm):
     pm.write(str(path))
 
 
-def write_musicxml(path, tracks, bpm, key=None, meter="4/4", unsure_below=None):
+def write_musicxml(path, tracks, bpm, key=None, meter="4/4", unsure_below=None, unsure_style="x"):
     """tracks: list of (name, clef, notes) with note times already on the constant-tempo grid."""
     from music21 import chord as m21chord
     from music21 import clef, instrument, metadata, meter as m21meter, note as m21note, stream, tempo
@@ -447,7 +447,9 @@ def write_musicxml(path, tracks, bpm, key=None, meter="4/4", unsure_below=None):
             ql = max(0.25, round(max(g.end - g.start for g in group) / spb * 4) / 4)
             el = m21note.Note(group[0].pitch) if len(group) == 1 else m21chord.Chord(sorted({g.pitch for g in group}))
             el.quarterLength = ql
-            if unsure_below is not None and len(group) == 1 and group[0].conf < unsure_below:
+            if unsure_below is not None and unsure_style == "color" and any(g.conf < unsure_below for g in group):
+                el.style.color = "#d00000"  # the independent checks disagree about this note
+            elif unsure_below is not None and len(group) == 1 and group[0].conf < unsure_below:
                 el.notehead = "x"  # pitch is a guess: spoken or unclear
             part.insert(on, el)
         part.makeVoices(inPlace=True, fillGaps=True) if part.hasVoices() else None

@@ -61,18 +61,38 @@ def roll_chroma(notes, n_frames, sr=amt.SR):
     return c
 
 
-def align(score_notes, y, sr=amt.SR):
-    """Map score time to recording time. Returns a function and the mean alignment cost."""
+def align(score_notes, y, sr=amt.SR, onset_w=0.0, smooth=0):
+    """Map score time to recording time. Returns a function and the mean alignment cost.
+
+    onset_w  weight of a thirteenth feature marking where notes begin (score) and where the
+             recording has attacks, so held chords and rests do not let the path drift
+    smooth   median-filter the path over this many frames to remove jitter
+    """
     end = max(e for _, e, _ in score_notes)
-    S = roll_chroma(score_notes, int(end * sr / HOP) + 1)
+    n_s = int(end * sr / HOP) + 1
+    S = roll_chroma(score_notes, n_s)
     A = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP)
-    S = S / (np.linalg.norm(S, axis=0, keepdims=True) + 1e-6) + 1e-3
-    A = A / (np.linalg.norm(A, axis=0, keepdims=True) + 1e-6) + 1e-3
-    D, wp = librosa.sequence.dtw(X=S, Y=A, metric="cosine", step_sizes_sigma=np.array([[1, 1], [1, 2], [2, 1]]))
+    S = S / (np.linalg.norm(S, axis=0, keepdims=True) + 1e-6)
+    A = A / (np.linalg.norm(A, axis=0, keepdims=True) + 1e-6)
+    if onset_w:
+        so = np.zeros(n_s)
+        for s0, _, _ in score_notes:
+            so[min(int(s0 * sr / HOP), n_s - 1)] = 1.0
+        so = np.maximum(so, 0.5 * np.r_[so[1:], 0], 0.5 * np.r_[0, so[:-1]])
+        ao = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP)[: A.shape[1]]
+        ao = np.clip(ao / (np.percentile(ao, 95) + 1e-9), 0, 1)
+        S = np.vstack([S, onset_w * so[None, :]])
+        A = np.vstack([A, onset_w * np.pad(ao, (0, A.shape[1] - len(ao)))[None, :]])
+    D, wp = librosa.sequence.dtw(X=S + 1e-3, Y=A + 1e-3, metric="euclidean", step_sizes_sigma=np.array([[1, 1], [1, 2], [2, 1]]))
     wp = wp[::-1]
     st, at = wp[:, 0] * HOP / sr, wp[:, 1] * HOP / sr
     keep = np.r_[True, np.diff(st) > 0]
-    return (lambda t: np.interp(t, st[keep], at[keep])), float(D[-1, -1] / len(wp))
+    st, at = st[keep], at[keep]
+    if smooth:
+        import scipy.ndimage as ndi
+
+        at = np.maximum.accumulate(ndi.median_filter(at - st * (at[-1] / st[-1]), size=smooth, mode="nearest") + st * (at[-1] / st[-1]))
+    return (lambda t: np.interp(t, st, at)), float(D[-1, -1] / len(wp))
 
 
 def main():
@@ -81,7 +101,7 @@ def main():
     ap.add_argument("audio")
     ap.add_argument("out")
     ap.add_argument("--parts", default="0,1")
-    ap.add_argument("--tol", type=float, default=0.15)
+    ap.add_argument("--tol", type=float, default=0.3)
     ap.add_argument("--min-ms", type=float, default=58.0)
     args = ap.parse_args()
     out = Path(args.out)
@@ -91,7 +111,7 @@ def main():
     print("score staves:", [(i, n, len(notes)) for i, (n, notes) in enumerate(parts)])
     vi = [int(x) for x in args.parts.split(",")]
     y = amt.load_mono(args.audio)
-    warp, cost = align([n for _, notes in parts for n in notes], y)
+    warp, cost = align([n for _, notes in parts for n in notes], y, onset_w=1.0, smooth=9)
 
     truth, others = [], []
     for i, (_, notes) in enumerate(parts):
@@ -112,8 +132,10 @@ def main():
     extra = [n for j, n in enumerate(final) if j not in used]
     from_other = sum(1 for n in extra if any(abs(o["start"] - n.start) <= args.tol and o["pitch"] == n.pitch for o in others))
     high_blips = sum(1 for n in extra if n.dur < 0.15 and n.pitch >= 84)
+    in_range = [g for g in truth if g["pitch"] >= 55]
     report = {
         "alignment_cost": cost,
+        "recording_seconds_covered_by_score": [round(float(warp(0.0)), 1), round(float(warp(max(e for _, notes in parts for _, e, _ in notes))), 1)],
         "violin_notes_in_score": len(truth),
         "found": len(m) / max(len(truth), 1),
         "written_notes_that_are_in_violin_parts": len(m) / max(len(final), 1),

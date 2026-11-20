@@ -172,6 +172,35 @@ def trim_tails(part, same_onset=0.05, tail=0.15):
     return [n for n in part if n.dur >= 0.06]
 
 
+def tone_disputes(y, A, B):
+    """Second opinion on the split from tone alone, with no labels needed.
+
+    Each violin's tone is learned from the notes where the split is safest (both parts sounding
+    at once), then every note is asked which violin it sounds like. Returns the ids of notes
+    where tone disagrees with the split, or None when there is too little overlap to learn from.
+    On the URMP benchmark the split is right for about 90% of notes where the two opinions agree
+    and about 71% where they disagree, so a disagreement marks a note worth checking by ear."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    import tone_experiment as te
+
+    S, freqs = te.spectrogram(y)
+    notes = A + B
+    part = {id(n): 0 for n in A} | {id(n): 1 for n in B}
+    other = {0: B, 1: A}
+    X = np.array([te.tone(S, freqs, n, [o for o in notes if o is not n and o.start < n.end and o.end > n.start]) for n in notes])
+    lab = np.array([part[id(n)] for n in notes])
+    safe = np.array([any(min(o.end, n.end) - max(o.start, n.start) > 0.5 * n.dur for o in other[part[id(n)]]) for n in notes])
+    if safe.sum() < 40 or len(set(lab[safe])) < 2:
+        return None
+    Xs, mean = te.fill(X[safe])
+    clf = make_pipeline(StandardScaler(), LogisticRegression(C=0.3, max_iter=2000)).fit(Xs, lab[safe])
+    vote = clf.predict(te.fill(X, mean)[0])
+    return {id(n) for n, v in zip(notes, vote) if v != part[id(n)]}
+
+
 def crossings(A, B, step=0.05):
     end = max(n.end for n in A + B)
     grid = np.arange(0, end, step)
@@ -229,6 +258,9 @@ def main():
     if not args.roles and np.mean([n.pitch for n in A] or [0]) < np.mean([n.pitch for n in B] or [0]):
         A, B = B, A
     names = ("Sustained line", "Moving line") if args.roles else ("Violin 1", "Violin 2")
+    disputed = None if args.roles else tone_disputes(y, A, B)
+    for n in A + B:
+        n.conf = 0.0 if disputed and id(n) in disputed else 1.0
     beats, bpm, jitter = amt.beat_grid(y)
     n_cross, frac_inverted, frac_both = crossings(A, B)
 
@@ -246,6 +278,7 @@ def main():
         "part_crossings": n_cross,
         "share_of_duet_time_part2_above_part1": frac_inverted,
         "chroma_agreement_with_audio": amt.chroma_agreement(A + B, y),
+        "notes_where_tone_disputes_the_split": None if disputed is None else len(disputed) / max(len(A) + len(B), 1),
         "tempo_bpm": bpm,
         "beat_jitter": jitter,
     }
@@ -263,7 +296,7 @@ def main():
     amt.write_midi(out / "duet_performance.mid", [(names[0], 40, A), (names[1], 40, B)], bpm)
     gA, gB = amt.warp(A, beats, bpm, grid=4), amt.warp(B, beats, bpm, grid=4)
     amt.write_midi(out / "duet_gridded.mid", [(names[0], 40, gA), (names[1], 40, gB)], bpm)
-    amt.write_musicxml(out / "duet.musicxml", [(names[0], "treble", gA), (names[1], "treble", gB)], bpm)
+    amt.write_musicxml(out / "duet.musicxml", [(names[0], "treble", gA), (names[1], "treble", gB)], bpm, unsure_below=0.5, unsure_style="color")
 
 
 if __name__ == "__main__":
