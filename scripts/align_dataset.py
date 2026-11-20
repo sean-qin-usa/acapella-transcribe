@@ -18,9 +18,10 @@ import eval_score  # noqa: E402
 
 def main():
     d, audio = Path(sys.argv[1]), sys.argv[2]
+    partial = "--partial" in sys.argv[3:]
     parts = eval_score.read_score(d / "score.mid")
     y = amt.load_mono(audio)
-    warp, cost = eval_score.align([n for _, notes in parts for n in notes], y, onset_w=1.0, smooth=9)
+    warp, cost = eval_score.align([n for _, notes in parts for n in notes], y, onset_w=1.0, smooth=9, partial=partial)
     with open(d / "notes_aligned.csv", "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["part", "start_sec", "end_sec", "pitch_midi"])
@@ -30,7 +31,7 @@ def main():
     meta_path = d / "score_meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     end = max(e for _, notes in parts for _, e, _ in notes)
-    meta["alignment"] = {"recording": Path(audio).name, "mean_cost": cost, "recording_span_sec": [round(float(warp(0.0)), 1), round(float(warp(end)), 1)], "recording_length_sec": round(len(y) / amt.SR, 1)}
+    meta["alignment"] = {"recording": Path(audio).name, "mean_cost": cost, "recording_span_sec": [round(warp.span[0], 1), round(warp.span[1], 1)], "partial": partial, "recording_length_sec": round(len(y) / amt.SR, 1)}
     meta_path.write_text(json.dumps(meta, indent=1))
     print(json.dumps(meta["alignment"], indent=1))
 

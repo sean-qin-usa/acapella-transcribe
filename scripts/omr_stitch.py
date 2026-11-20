@@ -47,12 +47,14 @@ def measure_notes(staff_part, number):
     return notes
 
 
-def stitch(pages_dir, layout, beats):
+def stitch(pages_dir, layout, beats, last_page=None):
     per_block = 2
     n_blocks = -(-len(layout) // per_block)
     rows, skipped, page_info, fill = [], [], [], []
     measure_index = 0
     for f in sorted(Path(pages_dir).glob("page-*.musicxml")):
+        if last_page is not None and int(re.search(r"(\d+)", f.stem).group(1)) > last_page:
+            continue
         blocks = blocks_of(f.read_text())
         staves = list(converter.parse(str(f)).parts)
         systems = [blocks[i : i + n_blocks] for i in range(0, len(blocks), n_blocks)]
@@ -85,11 +87,13 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--layout", default="Violin 1,Violin 2,Piano,Piano")
     ap.add_argument("--beats", type=float, default=4.0, help="quarter notes per measure")
+    ap.add_argument("--last-page", type=int, default=None, help="join pages 1..N only (use when later pages could not be read reliably)")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     layout = [x.strip() for x in args.layout.split(",")]
-    rows, page_info, check = stitch(args.pages, layout, args.beats)
+    rows, page_info, check = stitch(args.pages, layout, args.beats, args.last_page)
+    check["covers_pages"] = [1, args.last_page] if args.last_page else "all that could be joined"
 
     with open(out / "notes_score.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=["part", "staff", "measure", "beat", "duration_beats", "pitch_midi", "pitch_name", "page"])

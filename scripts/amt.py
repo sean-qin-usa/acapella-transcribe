@@ -379,6 +379,35 @@ def beat_chords(y, beats, sr=SR, per=2):
     return [labels[i] for i in score.argmax(axis=0)], chroma.mean(axis=1)
 
 
+def pad_from_harmony(y, beats, sr=SR, per=2, voices=3, low=55, floor=0.45):
+    """Sustained backing voices taken from what the instruments are playing.
+
+    Every `per` beats the strongest pitch classes in the instrumental are picked (up to `voices`,
+    each at least `floor` of the strongest), placed within one octave above `low`, and handed
+    to the voices from bottom to top. Repeated pitches are tied into held notes. This is an
+    arranging aid: the notes come from the recording's harmony, not from anyone singing them.
+    Returns one list of notes per voice, lowest voice first."""
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512, bins_per_octave=36)
+    frames = librosa.time_to_frames(beats, sr=sr, hop_length=512)
+    sync = librosa.util.sync(chroma, frames, aggregate=np.median)[:, 1:]
+    n = min(sync.shape[1], len(beats) - 1) // per
+    out = [[] for _ in range(voices)]
+    for k in range(n):
+        g = sync[:, k * per : (k + 1) * per].mean(axis=1)
+        order = [int(i) for i in np.argsort(g)[::-1] if g[i] >= floor * g.max()][:voices]
+        if len(order) < 2:
+            continue
+        pitches = sorted(low + (pc - low) % 12 for pc in order)
+        t0, t1 = float(beats[k * per]), float(beats[(k + 1) * per])
+        for v, p in enumerate(pitches):
+            last = out[v][-1] if out[v] else None
+            if last is not None and last.pitch == p and abs(last.end - t0) < 0.05:
+                last.end = t1
+            else:
+                out[v].append(Note(t0, t1, int(p), 0.6))
+    return out
+
+
 # ---------------------------------------------------------------- checks and export
 def chroma_agreement(notes, y, sr=SR):
     """Correlation between audio chroma and the chroma implied by the notes (1.0 = identical)."""

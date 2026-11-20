@@ -61,12 +61,16 @@ def roll_chroma(notes, n_frames, sr=amt.SR):
     return c
 
 
-def align(score_notes, y, sr=amt.SR, onset_w=0.0, smooth=0):
-    """Map score time to recording time. Returns a function and the mean alignment cost.
+def align(score_notes, y, sr=amt.SR, onset_w=0.0, smooth=0, partial=False):
+    """Map score time to recording time. Returns (warp function, mean alignment cost).
 
     onset_w  weight of a thirteenth feature marking where notes begin (score) and where the
              recording has attacks, so held chords and rests do not let the path drift
     smooth   median-filter the path over this many frames to remove jitter
+    partial  the score covers only part of the recording: find where it fits instead of
+             stretching it from the first second to the last
+    The returned function has a .span attribute: the (start, end) seconds of the recording
+    that the score was matched to.
     """
     end = max(e for _, e, _ in score_notes)
     n_s = int(end * sr / HOP) + 1
@@ -83,16 +87,23 @@ def align(score_notes, y, sr=amt.SR, onset_w=0.0, smooth=0):
         ao = np.clip(ao / (np.percentile(ao, 95) + 1e-9), 0, 1)
         S = np.vstack([S, onset_w * so[None, :]])
         A = np.vstack([A, onset_w * np.pad(ao, (0, A.shape[1] - len(ao)))[None, :]])
-    D, wp = librosa.sequence.dtw(X=S + 1e-3, Y=A + 1e-3, metric="euclidean", step_sizes_sigma=np.array([[1, 1], [1, 2], [2, 1]]))
+    D, wp = librosa.sequence.dtw(X=S + 1e-3, Y=A + 1e-3, metric="euclidean", subseq=partial, step_sizes_sigma=np.array([[1, 1], [1, 2], [2, 1]]))
     wp = wp[::-1]
+    cost = float((D[wp[-1][0], wp[-1][1]] - (D[wp[0][0], wp[0][1]] if partial else 0.0)) / len(wp))
     st, at = wp[:, 0] * HOP / sr, wp[:, 1] * HOP / sr
     keep = np.r_[True, np.diff(st) > 0]
     st, at = st[keep], at[keep]
     if smooth:
         import scipy.ndimage as ndi
 
-        at = np.maximum.accumulate(ndi.median_filter(at - st * (at[-1] / st[-1]), size=smooth, mode="nearest") + st * (at[-1] / st[-1]))
-    return (lambda t: np.interp(t, st, at)), float(D[-1, -1] / len(wp))
+        trend = at[0] + (st - st[0]) * (at[-1] - at[0]) / max(st[-1] - st[0], 1e-9)
+        at = np.maximum.accumulate(ndi.median_filter(at - trend, size=smooth, mode="nearest") + trend)
+
+    def warp(t):
+        return np.interp(t, st, at)
+
+    warp.span = (float(at[0]), float(at[-1]))
+    return warp, cost
 
 
 def main():
@@ -103,6 +114,7 @@ def main():
     ap.add_argument("--parts", default="0,1")
     ap.add_argument("--tol", type=float, default=0.3)
     ap.add_argument("--min-ms", type=float, default=58.0)
+    ap.add_argument("--partial", action="store_true", help="the score covers only part of the recording")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -111,7 +123,8 @@ def main():
     print("score staves:", [(i, n, len(notes)) for i, (n, notes) in enumerate(parts)])
     vi = [int(x) for x in args.parts.split(",")]
     y = amt.load_mono(args.audio)
-    warp, cost = align([n for _, notes in parts for n in notes], y, onset_w=1.0, smooth=9)
+    warp, cost = align([n for _, notes in parts for n in notes], y, onset_w=1.0, smooth=9, partial=args.partial)
+    lo, hi = warp.span
 
     truth, others = [], []
     for i, (_, notes) in enumerate(parts):
@@ -123,6 +136,8 @@ def main():
     raw = amt.poly_notes(args.audio, fmin=185.0, fmax=4200.0, min_ms=args.min_ms)
     A, B = duet.split_two_voices(list(raw))
     A, B = duet.trim_tails(A), duet.trim_tails(B)
+    A = [n for n in A if lo - args.tol <= n.start <= hi + args.tol]  # judge only where the score reaches
+    B = [n for n in B if lo - args.tol <= n.start <= hi + args.tol]
     final = A + B
     label = {id(n): 0 for n in A} | {id(n): 1 for n in B}
     eval_urmp.TOL = args.tol
@@ -135,7 +150,8 @@ def main():
     in_range = [g for g in truth if g["pitch"] >= 55]
     report = {
         "alignment_cost": cost,
-        "recording_seconds_covered_by_score": [round(float(warp(0.0)), 1), round(float(warp(max(e for _, notes in parts for _, e, _ in notes))), 1)],
+        "recording_seconds_covered_by_score": [round(lo, 1), round(hi, 1)],
+        "recording_length_sec": round(len(y) / amt.SR, 1),
         "violin_notes_in_score": len(truth),
         "found": len(m) / max(len(truth), 1),
         "written_notes_that_are_in_violin_parts": len(m) / max(len(final), 1),

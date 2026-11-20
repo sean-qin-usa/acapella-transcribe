@@ -110,7 +110,8 @@ def main():
         lead, tuned = amt.autotune(lead, scale)
     settle.update(scale=scale_name, scale_fit=scale_fit, next_best_scale_fit=runner_up, off_scale_share_before_autotune=off_scale_before, notes_autotuned=tuned)
     bass, _ = amt.mono_notes(y["bass"], fmin=30, fmax=260, cache=out / "f0_bass.npz", min_dur=0.15)
-    backing = amt.poly_notes(stems / "backing.flac", fmin=80, fmax=1100, onset=0.55, frame=0.35, min_ms=150)
+    backing = amt.poly_notes(stems / "backing.flac", fmin=80, fmax=1100, onset=0.4, frame=0.2, min_ms=100)
+    pad = amt.pad_from_harmony(y["other"] + 0.5 * y["bass"], beats)
     keys = amt.poly_notes(stems / "other.flac", fmin=60, fmax=2000, onset=0.6, frame=0.4, min_ms=150)
     drums = amt.drum_hits(y["drums"])
 
@@ -121,8 +122,10 @@ def main():
         q_per_beat, grid, meter = 1.5, 6, "12/8"
     qbpm = bpm * q_per_beat
     g = {k: amt.warp(v, beats, bpm, grid=grid) for k, v in (("lead", lead), ("backing", backing), ("bass", bass), ("keys", keys), ("drums", drums))}
+    gpad = [[n for n in amt.warp(v, beats, bpm, grid=grid) if n.start >= 0] for v in pad]
     for part in g.values():  # drop anything before bar 1
         part[:] = [n for n in part if n.start >= 0]
+    amt.write_check(out / "check_pad.wav", y["other"], [n for v in pad for n in v])  # instruments left, pad right
     for k in ("lead", "bass", "backing"):  # recording left, transcription right
         amt.write_check(out / ("check_%s.wav" % k), y[k], {"lead": lead, "bass": bass, "backing": backing}[k], shift=12 if k == "bass" else 0)
 
@@ -131,7 +134,8 @@ def main():
         [
             ("Lead vocal", 52, [n for n in g["lead"] if n.conf >= args.unsure]),
             ("Lead vocal (unclear pitch)", 52, [n for n in g["lead"] if n.conf < args.unsure]),
-            ("Backing vocals", 53, g["backing"]),
+            ("Backing vocals (as recorded)", 53, g["backing"]),
+            *[("Backing pad %d (from instruments)" % (len(gpad) - i), 52, v) for i, v in enumerate(reversed(gpad))],
             ("Bass", 33, g["bass"]),
             ("Instruments (reference)", 0, g["keys"]),
             ("Drums", "drums", g["drums"]),
@@ -145,7 +149,9 @@ def main():
     )
     amt.write_musicxml(
         out / (args.title + ".musicxml"),
-        [("Lead", "treble8vb", g["lead"]), ("Backing", "treble8vb", g["backing"]), ("Bass", "bass", g["bass"])],
+        [("Lead", "treble8vb", g["lead"]), ("Backing (as recorded)", "treble8vb", g["backing"])]
+        + [("Pad %d (from instruments)" % (len(gpad) - i), "treble8vb", v) for i, v in enumerate(reversed(gpad))]
+        + [("Bass", "bass", g["bass"])],
         qbpm,
         key=key,
         meter=meter,
@@ -182,6 +188,7 @@ def main():
             "simultaneous_notes_share": amt.polyphony_profile(backing),
         },
         "drums": {"kick": sum(n.pitch == 36 for n in drums), "snare": sum(n.pitch == 38 for n in drums), "hihat": sum(n.pitch == 42 for n in drums)},
+        "pad_from_instruments": {"voices": len(pad), "notes_per_voice": [len(v) for v in pad], "share_of_song_covered": float(sum(n.dur for n in pad[0]) / (len(y["other"]) / amt.SR)) if pad and pad[0] else 0.0},
         "backing_vocals_active_from_sec": round(min((n.start for n in backing), default=-1.0), 1),
         "lead_sections": sections(lead),
     }

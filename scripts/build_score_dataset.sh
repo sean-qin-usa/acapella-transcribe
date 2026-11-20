@@ -43,12 +43,15 @@ else
   done
 fi
 
-# 2. read each page (the reader lives in its own environment)
-for img in "$D"/pages/page-*.png; do
-  n=$(basename "$img" .png)
-  [ -e "$D/omr/$n.musicxml" ] && continue
-  .venv_omr/bin/oemer "$img" -o "$D/omr" --without-deskew --save-cache > "$D/omr/$n.log" 2>&1 || echo "page $n could not be read (see $D/omr/$n.log)"
-done
+# 2. read each page, several at a time (the reader lives in its own environment).
+#    Most of a page's time is CPU work after a short GPU step, so pages overlap well;
+#    JOBS=3 fits an 8 GB card. Pages that are already read are skipped.
+export D
+ls "$D"/pages/page-*.png | xargs -P "${JOBS:-3}" -I{} sh -c '
+  n=$(basename "{}" .png)
+  [ -e "$D/omr/$n.musicxml" ] && exit 0
+  .venv_omr/bin/oemer "{}" -o "$D/omr" --without-deskew --save-cache > "$D/omr/$n.log" 2>&1 || echo "page $n could not be read (see $D/omr/$n.log)"
+'
 
 # 3. join pages into one score, 4. optionally place it on a recording
 . .venv/bin/activate
