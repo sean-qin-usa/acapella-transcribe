@@ -10,14 +10,14 @@ The duet path is scored against nine two-violin recordings from the [URMP datase
 
 | | |
 |---|---|
-| Real notes found | **92.3%** |
-| Written notes that are real | **74.7%** |
-| Found notes placed in the right player's part | **85.3%** |
-| Fast notes (under 0.15 s) found | 83.7% |
-| Upper note found when the violins play in octaves | 75.1% |
+| Real notes found | **89.9%** |
+| Written notes that are real | **88.1%** |
+| Found notes placed in the right player's part | **84.2%** |
+| Fast notes (under 0.15 s) found | 81.6% |
+| Upper note found when the violins play in octaves | 73.4% |
 | Notes 10 dB or more quieter than the other violin found | 84.5% |
 
-The settings lean toward finding notes at the cost of writing extra ones, on the view that deleting a wrong note in a notation program is quicker than hearing and adding a missing one. Most of the extra notes are a held note written twice, and a smaller share are overtones an octave or a twelfth above a real note.
+The detector tends to write one held note as two or three, and on these pieces a back-to-back pair of the same pitch is a real repeated note about as often as it is a continuation, so merging them blindly costs 17 points of notes found. The recording settles it instead: at a real attack the level of that pitch jumps by a median of 6.8 dB and dips by 6.3 dB first, against 1.9 and -0.1 for a continuation, and a note is joined to the one before it only when neither shows. That check took the share of written notes that are real from 74.7% to 88.1% for 2.4 points of notes found; its two thresholds were chosen on half of the pieces, so part of that gain is in-sample (the held-out halves gave 13 and 15 points). What remains among the extra notes is mostly overtones an octave or a twelfth above a real note.
 
 ## Where it falls short
 
@@ -56,7 +56,7 @@ Every run writes `check_*.wav` files with the recording in the left ear and the 
 
 ## Checking against a score
 
-`scripts/eval_urmp.py` reproduces the table above (the `leap_filter` variant is the default pipeline) from a local copy of the URMP pieces that contain two violins, and reports the same figures broken down by note length, loudness and interval, which is how each setting was chosen. `scripts/eval_score.py` compares a transcription with sheet music in MusicXML or MIDI by stretching the score onto the recording's timing, and with `--partial` it accepts a score that covers only part of the recording. On four benchmark pieces its alignment puts 90% of notes within 150 ms of the annotated onset (median 49 ms), and its found-rate came out 2 to 7 points below the annotation-based figure on three of them and about 20 below on the fourth, so read its numbers as a lower bound.
+`scripts/eval_urmp.py` reproduces the table above (the `merge_held` variant is the default pipeline) from a local copy of the URMP pieces that contain two violins, and reports the same figures broken down by note length, loudness and interval, which is how each setting was chosen. `scripts/eval_score.py` compares a transcription with sheet music in MusicXML or MIDI by stretching the score onto the recording's timing, and with `--partial` it accepts a score that covers only part of the recording. On four benchmark pieces its alignment puts 90% of notes within 150 ms of the annotated onset (median 49 ms), and its found-rate came out 2 to 7 points below the annotation-based figure on three of them and about 20 below on the fourth, so read its numbers as a lower bound.
 
 ## Turning sheet music into a dataset
 
@@ -66,7 +66,7 @@ When a score exists, it is a better reference than any annotation made by ear, s
 scripts/build_score_dataset.sh score.pdf my_piece --layout "Violin 1,Violin 2,Piano,Piano" --audio recording.wav
 ```
 
-Each piece ends up in `datasets/my_piece/` as the page images, the reader's output per page, a `score.mid`, a `notes_score.csv` (part, measure, beat, duration, pitch) and a `notes_aligned.csv` (part, start, end, pitch), the last in the same shape as the URMP annotations. The reader runs in its own environment (`.venv_omr`) because it needs older versions of NumPy and OpenCV than the rest. Rhythms are the weak part of what it reads, with roughly six bars in ten adding up to a full measure on a clean engraving, and nothing is hand-checked, so treat the result as a draft reference until someone has looked it over.
+Each piece ends up in `datasets/my_piece/` as the page images, the reader's output per page, a `score.mid`, a `notes_score.csv` (part, measure, beat, duration, pitch) and a `notes_aligned.csv` (part, start, end, pitch), the last in the same shape as the URMP annotations. The reader runs in its own environment (`.venv_omr`) because it needs older versions of NumPy and OpenCV than the rest. The reader decides which staves belong together from the barlines that cross them, so a system that is one long measure, with no barline inside it, comes out scrambled; `scripts/helper_barlines.py` finds such systems and draws one extra barline at the emptiest column near the middle, and the two halves are merged back when the pages are joined. On the fifteen-page test score that turned five unreadable pages into fifteen joined ones. A page whose staves still cannot be placed is skipped and listed in `score_meta.json`, never guessed at. Rhythms are the weak part of what it reads, with roughly six bars in ten adding up to a full measure on a clean engraving, and nothing is hand-checked, so treat the result as a draft reference until someone has looked it over.
 
 ## A second opinion on who is playing
 
@@ -78,8 +78,8 @@ The duet tool also asks a question that does not depend on pitch movement: which
 - `scripts/pop.py` and `scripts/run_pop.sh` are the pop path.
 - `scripts/duet.py` is the two-instrument path, including the part splitter.
 - `scripts/eval_urmp.py` and `scripts/eval_score.py` are the two checkers.
-- `scripts/build_score_dataset.sh`, `scripts/omr_stitch.py` and `scripts/align_dataset.py` are the sheet-music path.
-- `scripts/tone_experiment.py` is the tone experiment behind the second opinion.
+- `scripts/build_score_dataset.sh`, `scripts/helper_barlines.py`, `scripts/omr_stitch.py` and `scripts/align_dataset.py` are the sheet-music path.
+- `scripts/tone_experiment.py` is the tone experiment behind the second opinion, `scripts/rearticulation_experiment.py` the one behind the held-note check, and `scripts/instrument_experiment.py` an attempt to tell struck notes from bowed ones that did not work well enough to use (69% against 59% for guessing).
 - `scripts/plot_line.py` and `scripts/probe_stereo.py` are small diagnostics.
 
 No audio, stems, scores or transcriptions of commercial recordings are included.

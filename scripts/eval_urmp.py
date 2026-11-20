@@ -32,6 +32,7 @@ VARIANTS = {
     "ring_ok": dict(min_ms=58, onset=0.5, frame=0.3, fmax=4200.0, ghosts=False, trim=True, split=dict(ring_ok=True)),
     "blip_filter": dict(min_ms=58, onset=0.5, frame=0.3, fmax=4200.0, ghosts=False, trim=True, blips=True),
     "leap_filter": dict(min_ms=58, onset=0.5, frame=0.3, fmax=4200.0, ghosts=False, trim=True, leap=True),
+    "merge_held": dict(min_ms=58, onset=0.5, frame=0.3, fmax=4200.0, ghosts=False, trim=True, leap=True, held=True),
     "merge_repeats": dict(min_ms=58, onset=0.5, frame=0.3, fmax=4200.0, ghosts=False, trim=True, merge=0.03),
     "quiet_notes": dict(min_ms=110, onset=0.3, frame=0.2, fmax=3600.0, ghosts=True, trim=True),
 }
@@ -75,6 +76,7 @@ def match(truth, est):
 
 
 _DETECTED = {}
+_AUDIO = {}
 
 
 def run(mix, cfg):
@@ -84,6 +86,10 @@ def run(mix, cfg):
     raw = copy.deepcopy(_DETECTED[key])
     if cfg.get("merge") is not None:
         raw = duet.merge_repeats(raw, cfg["merge"])
+    if cfg.get("held"):
+        if str(mix) not in _AUDIO:
+            _AUDIO[str(mix)] = amt.load_mono(mix)
+        raw = amt.merge_held(raw, _AUDIO[str(mix)])
     kept = duet.drop_overtone_ghosts(raw) if cfg["ghosts"] else list(raw)
     if cfg.get("blips"):
         kept = duet.drop_blips(kept)

@@ -7,6 +7,7 @@
 # Writes datasets/<name>/:
 #   pages/page-NN.png      the page images that were read
 #   omr/page-NN.musicxml   what the reader made of each page (kept so a bad page can be redone alone)
+#   pages_helped/, omr_helped/   the same for pages that needed a helper barline
 #   score.mid              all pages joined, one track per part, in score time
 #   notes_score.csv        one row per note: part, measure, beat, duration, pitch
 #   notes_aligned.csv      the same notes placed on the recording's clock (only with --audio)
@@ -43,19 +44,24 @@ else
   done
 fi
 
-# 2. read each page, several at a time (the reader lives in its own environment).
-#    Most of a page's time is CPU work after a short GPU step, so pages overlap well;
-#    JOBS=3 fits an 8 GB card. Pages that are already read are skipped.
+# 2. give single-measure systems a helper barline (the reader cannot group their staves
+#    otherwise), then read each page several at a time. Pages already read are skipped.
+. .venv/bin/activate
+mkdir -p "$D/pages_helped" "$D/omr_helped"
+for img in "$D"/pages/page-*.png; do
+  python -I scripts/helper_barlines.py "$img" "$D/pages_helped/$(basename "$img")" > /dev/null
+done
 export D
 ls "$D"/pages/page-*.png | xargs -P "${JOBS:-3}" -I{} sh -c '
   n=$(basename "{}" .png)
-  [ -e "$D/omr/$n.musicxml" ] && exit 0
-  .venv_omr/bin/oemer "{}" -o "$D/omr" --without-deskew --save-cache > "$D/omr/$n.log" 2>&1 || echo "page $n could not be read (see $D/omr/$n.log)"
+  [ -e "$D/omr/$n.musicxml" ] || .venv_omr/bin/oemer "{}" -o "$D/omr" --without-deskew --save-cache > "$D/omr/$n.log" 2>&1 || echo "page $n could not be read as is (see $D/omr/$n.log)"
+  if grep -q "\"helper\": true" "$D/pages_helped/$n.png.json" && [ ! -e "$D/omr_helped/$n.musicxml" ]; then
+    .venv_omr/bin/oemer "$D/pages_helped/$n.png" -o "$D/omr_helped" --without-deskew --save-cache > "$D/omr_helped/$n.log" 2>&1 || echo "page $n could not be read with helper barlines (see $D/omr_helped/$n.log)"
+  fi
 '
 
 # 3. join pages into one score, 4. optionally place it on a recording
-. .venv/bin/activate
-python -I scripts/omr_stitch.py "$D/omr" "$D" --layout "$layout" --beats "$beats"
+python -I scripts/omr_stitch.py "$D/omr" "$D" --layout "$layout" --beats "$beats" --helped "$D/omr_helped" --page-info "$D/pages_helped"
 if [ -n "$audio" ]; then
   python -I scripts/align_dataset.py "$D" "$audio"
 fi

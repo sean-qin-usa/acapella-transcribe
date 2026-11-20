@@ -226,6 +226,7 @@ def main():
     ap.add_argument("--fmax", type=float, default=4200.0)
     ap.add_argument("--onset", type=float, default=0.5)
     ap.add_argument("--min-ms", type=float, default=58.0, help="shortest note to keep")
+    ap.add_argument("--keep-rewrites", action="store_true", help="do not join a held note that the detector wrote twice")
     ap.add_argument("--solo", default="", help="time ranges where only one violin plays, e.g. 0-13,95-102 (seconds)")
     ap.add_argument("--roles", action="store_true", help="split into a sustained line and a moving line instead of guessing which player is which")
     ap.add_argument("--keep-leaps", action="store_true", help="keep short notes that jump far above their neighbours")
@@ -239,6 +240,8 @@ def main():
     y = amt.load_mono(args.audio)
     raw = amt.poly_notes(args.audio, fmin=args.fmin, fmax=args.fmax, onset=args.onset, frame=args.frame, min_ms=args.min_ms)
     notes = drop_overtone_ghosts(raw) if args.drop_overtones else list(raw)
+    if not args.keep_rewrites:
+        notes = amt.merge_held(notes, y)
     if args.drop_blips:
         notes = drop_blips(notes)
     A, B = split_two_voices(notes, role_w=3.0) if args.roles else split_two_voices(notes)
@@ -266,7 +269,7 @@ def main():
 
     report = {
         "notes_raw": len(raw),
-        "notes_after_overtone_filter": len(notes),
+        "notes_after_joining_held_notes": len(notes),
         "part1_notes": len(A),
         "part2_notes": len(B),
         "part1_range": [amt.name(min(n.pitch for n in A)), amt.name(max(n.pitch for n in A))],

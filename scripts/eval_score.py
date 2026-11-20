@@ -115,6 +115,7 @@ def main():
     ap.add_argument("--tol", type=float, default=0.3)
     ap.add_argument("--min-ms", type=float, default=58.0)
     ap.add_argument("--partial", action="store_true", help="the score covers only part of the recording")
+    ap.add_argument("--keep-rewrites", action="store_true", help="do not join a held note that the detector wrote twice")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -134,6 +135,8 @@ def main():
     truth.sort(key=lambda g: g["start"])
 
     raw = amt.poly_notes(args.audio, fmin=185.0, fmax=4200.0, min_ms=args.min_ms)
+    if not args.keep_rewrites:
+        raw = amt.merge_held(raw, y)
     A, B = duet.split_two_voices(list(raw))
     A, B = duet.trim_tails(A), duet.trim_tails(B)
     A = [n for n in A if lo - args.tol <= n.start <= hi + args.tol]  # judge only where the score reaches
