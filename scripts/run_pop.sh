@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . .venv/bin/activate
 export PATH="$(python -c "import static_ffmpeg, shutil, os; static_ffmpeg.add_paths(); print(os.path.dirname(shutil.which(\"ffmpeg\")))"):$PATH"
-audio=$1; name=$2; S=out/$name/stems
+audio=$1; name=$2; S=out/$name/work/stems   # results go in out/<name>/, working files in out/<name>/work/
 mkdir -p "$S"
 sep() { audio-separator "$1" -m "$2" --model_file_dir models --output_dir "$3" --output_format FLAC --log_level WARNING; }
 pick() { mv "$(ls "$1"/*"($2)"*.flac | head -1)" "$3"; }

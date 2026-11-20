@@ -10,6 +10,7 @@ usage: .venv_mt3/bin/python scripts/run_yourmt3.py <recording> <out.mid>
 """
 import os
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -60,11 +61,10 @@ def main():
             notes, err = merge_zipped_note_events_and_ties_to_notes(zipped)
             notes_by_channel.append(notes)
             errors += err
-        out_dir = out_path.parent / "_yourmt3_tmp"
-        write_model_output_as_midi(mix_notes(notes_by_channel), str(out_dir) + "/", out_path.stem, model.midi_output_inverse_vocab)
-        produced = out_dir / "model_output" / (out_path.stem + ".mid")
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(produced, out_path)
+        with tempfile.TemporaryDirectory(dir=out_path.parent) as tmp:  # the model writes into a folder of its own
+            write_model_output_as_midi(mix_notes(notes_by_channel), tmp + "/", out_path.stem, model.midi_output_inverse_vocab)
+            os.replace(Path(tmp) / "model_output" / (out_path.stem + ".mid"), out_path)
         print("wrote", out_path, "| segments", segments.shape[0], "| decoding errors", dict(errors), flush=True)
 
 

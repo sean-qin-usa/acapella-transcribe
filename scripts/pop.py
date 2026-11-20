@@ -97,7 +97,9 @@ def main():
     key, key_conf = amt.estimate_key(chroma_mean)
 
     # parts
-    lead, lead_tuning = amt.mono_notes(y["lead"], fmin=65, fmax=1000, cache=out / "f0_lead.npz")
+    work = out / "work"  # caches and other working files stay out of the way of the results
+    work.mkdir(exist_ok=True)
+    lead, lead_tuning = amt.mono_notes(y["lead"], fmin=65, fmax=1000, cache=work / "f0_lead.npz")
     lead_found = len(lead)
     unsure_time = sum(n.dur for n in lead if n.conf < args.unsure) / max(sum(n.dur for n in lead), 1e-9)
     lead, settle = amt.settle_uncertain(lead, args.unsure)
@@ -109,7 +111,7 @@ def main():
     if not args.no_autotune:
         lead, tuned = amt.autotune(lead, scale)
     settle.update(scale=scale_name, scale_fit=scale_fit, next_best_scale_fit=runner_up, off_scale_share_before_autotune=off_scale_before, notes_autotuned=tuned)
-    bass, _ = amt.mono_notes(y["bass"], fmin=30, fmax=260, cache=out / "f0_bass.npz", min_dur=0.15)
+    bass, _ = amt.mono_notes(y["bass"], fmin=30, fmax=260, cache=work / "f0_bass.npz", min_dur=0.15)
     backing = amt.poly_notes(stems / "backing.flac", fmin=80, fmax=1100, onset=0.4, frame=0.2, min_ms=100)
     pad = amt.pad_from_harmony(y["other"] + 0.5 * y["bass"], beats)
     keys = amt.poly_notes(stems / "other.flac", fmin=60, fmax=2000, onset=0.6, frame=0.4, min_ms=150)
