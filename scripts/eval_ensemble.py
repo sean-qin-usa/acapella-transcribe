@@ -33,6 +33,7 @@ def main():
     ap.add_argument("--family", default="strings")
     ap.add_argument("--floors", default="G3,G3,C3,C2", help="lowest playable note of each part, highest part first")
     ap.add_argument("--tol", type=float, default=0.3)
+    ap.add_argument("--transpose", default="auto", help="semitones to move the score to the recording's pitch, or 'auto' to find it (an edition in another octave, a choir at Baroque pitch)")
     ap.add_argument("--align", default="notes", choices=["notes", "harmony"], help="line the score up with the recording by individual notes (heard by the built-in detector) or by harmony")
     args = ap.parse_args()
 
@@ -40,10 +41,28 @@ def main():
     names = [n for n, _ in parts]
     floors = [duet.note_number(x) for x in args.floors.split(",")]
     y = amt.load_mono(args.audio)
+    # the built-in detector is independent of the transcription being judged
+    heard = [(n.start, n.end, n.pitch) for n in amt.poly_notes(args.audio, fmin=60.0, fmax=4200.0, min_ms=58)]
+    if args.transpose == "auto":
+        # the shift at which the score's pitches best match the pitches heard, ignoring timing
+        from collections import Counter
+
+        counts = Counter(p for _, _, p in heard)
+        total = sum(len(notes) for _, notes in parts)
+
+        def fit(shift):
+            want = Counter(p + shift for _, notes in parts for _, _, p in notes)
+            return sum(min(want[p], counts[p]) for p in want) / total
+
+        fits = {shift: fit(shift) for shift in range(-14, 15)}
+        transpose = max(fits, key=lambda k: (fits[k], -abs(k)))
+        runner_up = max(v for k, v in fits.items() if k != transpose)
+    else:
+        transpose, fits, runner_up = int(args.transpose), None, None
+    parts = [(name, [(s0, e0, p0 + transpose) for s0, e0, p0 in notes]) for name, notes in parts]
+    floors = [f + transpose for f in floors]
     everything = [n for _, notes in parts for n in notes]
     if args.align == "notes":
-        # the built-in detector is independent of the transcription being judged
-        heard = [(n.start, n.end, n.pitch) for n in amt.poly_notes(args.audio, fmin=60.0, fmax=4200.0, min_ms=58)]
         warp, cost = eval_score.align_to_notes(everything, heard, len(y) / amt.SR)
     else:
         warp, cost = eval_score.align(everything, y, onset_w=1.0, smooth=9)
@@ -59,6 +78,8 @@ def main():
     chance = float(np.mean([len(eval_urmp.match(truth(s), det)) / len(t) for s in (5.0, -5.0, 9.0)]))
     report = {
         "aligned_by": args.align,
+        "score_moved_by_semitones": transpose,
+        "pitch_match_at_that_shift_and_next_best": None if fits is None else [round(fits[transpose], 2), round(runner_up, 2)],
         "recording_seconds": round(len(y) / amt.SR, 1),
         "tracks_in_transcription": labels,
         "score_notes": len(t),

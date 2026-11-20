@@ -319,6 +319,61 @@ def stack_by_pitch(notes, n_parts, floors=None):
     return parts
 
 
+def imitation_delay(notes, lo=0.5, hi=12.0, step=0.02, tol=0.08):
+    """In a canon or round the second player repeats the first after a fixed delay. Returns
+    (delay in seconds, share of note pairs that come back at that delay, the same share at a
+    typical other delay), or None if there are too few notes.
+
+    The test is on pairs of consecutive notes (this pitch, then that pitch, this far apart),
+    not single pitches: one pitch recurs all the time, and a detector that writes a held note
+    twice makes every note 'repeat' a fraction of a second later."""
+    seq = sorted(notes, key=lambda n: (n.start, n.pitch))
+    pairs = {}
+    for i, a in enumerate(seq):
+        for b in seq[i + 1 : i + 4]:
+            gap = b.start - a.start
+            if 0.05 < gap <= 0.6 and b.pitch != a.pitch:
+                pairs.setdefault((a.pitch, b.pitch, round(gap / 0.06)), []).append(a.start)
+    if len(pairs) < 20:
+        return None
+    lags = np.arange(lo, hi, step)
+    score = np.zeros(len(lags))
+    total = 0
+    for ts in pairs.values():
+        ts = np.array(ts)
+        total += len(ts)
+        d = (ts[None, :] - ts[:, None]).ravel()
+        for x in d[(d > lo - tol) & (d < hi + tol)]:
+            score[(lags > x - tol) & (lags < x + tol)] += 1
+    k = int(np.argmax(score))
+    return float(lags[k]), float(score[k] / max(total, 1)), float(np.median(score) / max(total, 1))
+
+
+def split_canon(notes, delay, tol=0.12):
+    """Divide a canon at the unison: a note that comes back `delay` seconds later belongs to the
+    leader, a note that was heard `delay` seconds earlier to the follower. Notes for which both
+    or neither hold go to whichever line has the nearest decided note in pitch and time.
+    Returns (leader notes, follower notes, share of notes the delay decided on its own)."""
+    by = {}
+    for n in notes:
+        by.setdefault(n.pitch, []).append(n.start)
+    by = {p: np.array(ts) for p, ts in by.items()}
+    lead, follow, unsure = [], [], []
+    for n in notes:
+        later = bool(np.any(np.abs(by[n.pitch] - (n.start + delay)) <= tol))
+        earlier = bool(np.any(np.abs(by[n.pitch] - (n.start - delay)) <= tol))
+        (lead if later and not earlier else follow if earlier and not later else unsure).append(n)
+    decided = (len(lead) + len(follow)) / max(len(notes), 1)
+    A, B = list(lead), list(follow)
+
+    def distance(n, line):
+        return min((abs(m.pitch - n.pitch) + 4 * abs(m.start - n.start) for m in line if abs(m.start - n.start) < 1.0), default=99.0)
+
+    for n in unsure:
+        (A if distance(n, lead) <= distance(n, follow) else B).append(n)
+    return sorted(A, key=lambda n: n.start), sorted(B, key=lambda n: n.start), decided
+
+
 def crossings(A, B, step=0.05):
     end = max(n.end for n in A + B)
     grid = np.arange(0, end, step)
@@ -371,6 +426,7 @@ def main():
     ap.add_argument("--fmax", type=float, default=4200.0)
     ap.add_argument("--onset", type=float, default=0.5)
     ap.add_argument("--min-ms", type=float, default=58.0, help="shortest note to keep")
+    ap.add_argument("--canon", nargs="?", const="auto", default=None, metavar="SECONDS", help="the piece is a canon or round at the same pitch: divide the players by the delay between them (found from the notes, or given in seconds). Not automatic, because ordinary accompaniment figures repeat too")
     ap.add_argument("--notes-from", default=None, help="take the notes from this MIDI file (for example one written by scripts/run_yourmt3.py) instead of running the built-in detector")
     ap.add_argument("--join-held", action="store_true", help="with --notes-from: also join a held note written twice (off by default; it cost 2 points of notes found on both recordings that have an answer key)")
     ap.add_argument("--lowest", default=None, help="lowest note these instruments can play, e.g. G3 for violins; anything below it cannot be theirs and goes to the accompaniment")
@@ -417,7 +473,18 @@ def main():
         if args.drop_blips:
             notes = drop_blips(notes)
         source = {"notes_from": "built-in detector"}
-    A, B, stereo = split_parts(notes, args.audio, roles=args.roles, use_stereo=not args.no_stereo, clean=bool(args.notes_from))
+    if args.canon:
+        if args.canon == "auto":
+            found = imitation_delay(notes, lo=1.0)
+            if found is None:
+                raise SystemExit("too few notes to find a canon delay; give it in seconds with --canon")
+            delay, strength, typical = found
+        else:
+            delay, strength, typical = float(args.canon), None, None
+        A, B, decided = split_canon(notes, delay)
+        stereo = {"split_by": "canon delay", "delay_sec": round(delay, 2), "decided_by_delay_alone": round(decided, 2), "note_pairs_returning_at_delay": strength, "at_a_typical_delay": typical}
+    else:
+        A, B, stereo = split_parts(notes, args.audio, roles=args.roles, use_stereo=not args.no_stereo, clean=bool(args.notes_from))
     for span in filter(None, "" if args.roles else args.solo.split(",")):  # a hint from someone who knows the piece
         lo, hi = (float(x) for x in span.split("-"))
         inA = [n for n in A if lo <= n.start < hi]
@@ -431,12 +498,12 @@ def main():
     A, B = trim_tails(A), trim_tails(B)
     if not args.keep_leaps:
         A, B = drop_leap_blips(A), drop_leap_blips(B)
-    if not args.roles and np.mean([n.pitch for n in A] or [0]) < np.mean([n.pitch for n in B] or [0]):
+    if not args.roles and not args.canon and np.mean([n.pitch for n in A] or [0]) < np.mean([n.pitch for n in B] or [0]):
         A, B = B, A
-    names = ("Sustained line", "Moving line") if args.roles else ("Violin 1", "Violin 2")
+    names = ("Sustained line", "Moving line") if args.roles else ("Leader", "Follower") if args.canon else ("Violin 1", "Violin 2")
     # the tone check was validated against the pitch-based split; after a split by side it
     # disagrees with nearly half the notes and tells you nothing, so it is skipped there
-    disputed = None if args.roles or stereo.get("split_by", "").startswith("left/right position") else tone_disputes(y, A, B)
+    disputed = None if args.roles or args.canon or stereo.get("split_by", "").startswith("left/right position") else tone_disputes(y, A, B)
     for n in A + B:
         n.conf = 0.0 if disputed and id(n) in disputed else 1.0
     beats, bpm, jitter = amt.beat_grid(y)

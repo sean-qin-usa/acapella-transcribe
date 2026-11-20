@@ -40,6 +40,25 @@ python -I scripts/duet.py recording.wav out/my_piece --notes-from out/my_piece/m
 
 The model's code and checkpoint are not part of this repository: they go under `tools/yourmt3/`, with their own environment in `.venv_mt3`.
 
+## Six recordings it had never heard
+
+The benchmark above is studio audio that the instrument-aware model was trained on, so the fairer test is recordings from outside any training set, checked against scores that are already machine-readable (the music21 corpus and the Mutopia Project), with no page reading involved. `scripts/eval_ensemble.py` lines the score up with the recording, finds the transposition if the edition or the tuning differs, and counts.
+
+| Recording | Notes found: model | plain detector | Written notes in the score: model | plain detector | Found notes given to the right player |
+|---|---|---|---|---|---|
+| Bach, Prelude in C, BWV 846 (piano) | **93%** | 85% | **91%** | 58% | one player |
+| Mozart, quartet K. 458, Adagio | **87%** | | 77% | | 84% of four |
+| Joplin, Maple Leaf Rag (piano) | 84% | 75% | 77% | 67% | one player |
+| Telemann, canonic sonata no. 1, Vivace (two violins) | 79% | **82%** | 74% | **82%** | 80% with the canon rule, 50% without |
+| Beethoven, quartet Op. 18 No. 1, Adagio (live) | 48% | | 42% | | 71% of four |
+| Bach, chorale from the motet BWV 227 (choir) | 41% | 52% | 40% | 40% | 78 to 85% of four |
+
+Between 6% and 32% of notes would count as found by coincidence, most on the rag, whose sections repeat. Three things stand out. The instrument-aware model is not uniformly better: on two violins alone the plain detector with the held-note check matches or beats it. A live quartet in a slow movement is far harder than a studio one, and even ignoring fine timing only 68% of its pitches turn up in the right five-second stretch, against 89% for the Mozart. And voices are the weakest case of all: the model hears a choir mostly as strings and finds two notes in five, the plain detector finds the sopranos (81%) and loses the tenors (32%).
+
+Dividing four players uses the same evidence as dividing two, plus the lowest note each instrument can produce (`split_voices` in `scripts/duet.py`); it beats stacking the notes top to bottom on the quartets and loses to it on the chorale, where all four voices move together. A canon defeats both, because the two players share one register and one line; there the players are told apart by the delay between them, found from pairs of notes that come back a fixed time later (`--canon`). Ordinary accompaniment figures repeat just as strongly at short delays, so that rule is an option and not automatic. Left/right position, which settled the two violins with piano, adds about a point on these quartets: the four players sit too close together in the stereo image.
+
+Lining the score up by individual notes instead of by harmony cut the typical timing error on the benchmark from 47 ms to 27 ms, and slow movements needed the score stretched to the recording's length first, since the alignment cannot bend the tempo by more than a factor of two.
+
 ## Where it falls short
 
 Telling the two players apart is the weak point, and what helps depends on the recording. In mono, nothing in the pitches says which violin is playing when one of them plays alone: on a piece with a full score to check against, the two violins' solo passages sat in practically the same range, and the best possible pitch cut-off placed 57% of those notes correctly. A stereo recording can carry the answer in where each player sits. When the notes of a recording are spread widely between left and right, the parts are divided by side instead, which on that piece (two violins about 7 dB apart, with piano) placed 83% of violin notes in the right part against 62% for pitch movement; mixing the two kinds of evidence did worse than position alone, because the piano's notes pull the pitch-based logic around. The spread that triggers this was set from three recordings and `--no-stereo` turns it off. For mono recordings a `--solo` hint for passages you know are one player, and a `--roles` mode that divides the music into a sustained line and a moving line, are the workarounds; the roles mode suits pieces where each player keeps a role for a whole phrase and scored worse than the plain split on the piece above, where the pattern changes almost every bar.
@@ -99,7 +118,7 @@ The duet tool also asks a question that does not depend on pitch movement: which
 - `scripts/pop.py` and `scripts/run_pop.sh` are the pop path.
 - `scripts/duet.py` is the two-instrument path, including the part splitter.
 - `scripts/run_yourmt3.py` runs the instrument-aware model whose output `duet.py` can take in place of its own detector.
-- `scripts/eval_urmp.py` and `scripts/eval_score.py` are the two checkers.
+- `scripts/eval_urmp.py`, `scripts/eval_score.py` and `scripts/eval_ensemble.py` are the checkers: against the benchmark's annotations, against a score read from pages, and against a machine-readable score for any number of players.
 - `scripts/build_score_dataset.sh`, `scripts/helper_barlines.py`, `scripts/omr_stitch.py` and `scripts/align_dataset.py` are the sheet-music path.
 - `scripts/tone_experiment.py` is the tone experiment behind the second opinion, `scripts/rearticulation_experiment.py` the one behind the held-note check, and `scripts/instrument_experiment.py` an attempt to tell struck notes from bowed ones that did not work well enough to use (69% against 59% for guessing).
 - `scripts/plot_line.py` and `scripts/probe_stereo.py` are small diagnostics.
