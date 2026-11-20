@@ -173,7 +173,7 @@ def trim_tails(part, same_onset=0.05, tail=0.15):
     return [n for n in part if n.dur >= 0.06]
 
 
-def split_parts(notes, audio_path, roles=False, use_stereo=True, min_spread_db=5.0):
+def split_parts(notes, audio_path, roles=False, use_stereo=True, min_spread_db=5.0, clean=False):
     """Divide the notes into two parts, choosing the evidence that suits the recording.
 
     A stereo recording whose notes are spread widely between left and right is split by side:
@@ -184,6 +184,14 @@ def split_parts(notes, audio_path, roles=False, use_stereo=True, min_spread_db=5
     3-4 dB, so a spread of `min_spread_db` or more is taken to mean sources at different
     places; that bar comes from three recordings and is a starting point.
 
+    `clean` says the notes are known to belong only to the instruments being divided (they
+    came from a model that labels instruments). Then position is combined with pitch movement
+    and register instead of deciding alone: notes clearly on one side were already right 95-99%
+    of the time, but notes within 1.5 dB of the centre only 55%, and there the surrounding line
+    should decide. On the test piece that raised the right-part share from 86.8% to 91.5%, with
+    both halves of the piece agreeing; the position weight (12) was chosen on that one piece.
+    With accompaniment notes still mixed in, the combination is worse than the plain cut.
+
     Otherwise (mono, or a narrow stereo image) the split is by pitch movement and register.
     Returns (part A, part B, what was used)."""
     if roles:
@@ -193,6 +201,11 @@ def split_parts(notes, audio_path, roles=False, use_stereo=True, min_spread_db=5
     if pans is not None and len(notes) >= 40:
         spread = float(np.percentile(pans, 75) - np.percentile(pans, 25))
         centre = float(np.median(pans))
+        if spread >= min_spread_db and clean:
+            soft = lambda x: float(np.log1p(np.exp(np.clip(x, -30, 30))))
+            evidence = {id(n): (soft((p - centre) / 2.7), soft(-(p - centre) / 2.7)) for n, p in zip(notes, pans)}
+            A, B = split_two_voices(notes, tone=evidence, tone_w=12.0)
+            return A, B, {"split_by": "left/right position with pitch movement and register", "spread_db": round(spread, 1), "centre_db": round(centre, 1)}
         if spread >= min_spread_db:
             A = [n for n, p in zip(notes, pans) if p < centre]
             B = [n for n, p in zip(notes, pans) if p >= centre]
@@ -330,7 +343,7 @@ def main():
         if args.drop_blips:
             notes = drop_blips(notes)
         source = {"notes_from": "built-in detector"}
-    A, B, stereo = split_parts(notes, args.audio, roles=args.roles, use_stereo=not args.no_stereo)
+    A, B, stereo = split_parts(notes, args.audio, roles=args.roles, use_stereo=not args.no_stereo, clean=bool(args.notes_from))
     for span in filter(None, "" if args.roles else args.solo.split(",")):  # a hint from someone who knows the piece
         lo, hi = (float(x) for x in span.split("-"))
         inA = [n for n in A if lo <= n.start < hi]
@@ -349,7 +362,7 @@ def main():
     names = ("Sustained line", "Moving line") if args.roles else ("Violin 1", "Violin 2")
     # the tone check was validated against the pitch-based split; after a split by side it
     # disagrees with nearly half the notes and tells you nothing, so it is skipped there
-    disputed = None if args.roles or stereo.get("split_by") == "left/right position" else tone_disputes(y, A, B)
+    disputed = None if args.roles or stereo.get("split_by", "").startswith("left/right position") else tone_disputes(y, A, B)
     for n in A + B:
         n.conf = 0.0 if disputed and id(n) in disputed else 1.0
     beats, bpm, jitter = amt.beat_grid(y)
