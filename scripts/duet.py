@@ -93,7 +93,7 @@ def effective_durations(notes, gap=0.05):
         n.eff = n.eff or n.dur
 
 
-def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=0.0, role_split=0.45):
+def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=0.0, role_split=0.45, tone=None, tone_w=0.0):
     """Beam search over assignments: each part should move by small steps and rarely play two notes at once.
 
     idle   extra cost for handing a note to the part that is resting while the other part is the
@@ -101,6 +101,8 @@ def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=
     dur_w  cost per doubling/halving of note length relative to the part's previous note
            (keeps a run of short notes together and a sustained line together)
     ring_ok  treat an overlap as a second string only if it also covers half of the new note
+    tone     optional {id(note): (cost if player 0, cost if player 1)} from a tone classifier;
+             with it part A is player 0 and part B is player 1
     role_w   split by role instead of by player: part A is the sustained line and part B the
              moving line. Cost per doubling that a note's held length is on the wrong side of
              `role_split` seconds for the part it is given to.
@@ -132,6 +134,8 @@ def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=
             for v, (pa, pb) in enumerate(((n, b), (a, n))):
                 other = b if v == 0 else a
                 c = cost + step_cost(a if v == 0 else b, n, other)
+                if tone is not None and id(n) in tone:
+                    c += tone_w * tone[id(n)][v]
                 if role_w:
                     ratio = math.log2(max(n.eff, 0.03) / role_split)
                     c += role_w * min(max(-ratio if v == 0 else ratio, 0.0), 3.0)
@@ -146,7 +150,7 @@ def split_two_voices(notes, beam=96, idle=0.0, dur_w=0.0, ring_ok=False, role_w=
     labels = states[0][3]
     A = [n for n, v in zip(notes, labels) if v == 0]
     B = [n for n, v in zip(notes, labels) if v == 1]
-    if not role_w and np.mean([n.pitch for n in A] or [0]) < np.mean([n.pitch for n in B] or [0]):
+    if not role_w and tone is None and np.mean([n.pitch for n in A] or [0]) < np.mean([n.pitch for n in B] or [0]):
         A, B = B, A
     return A, B
 
