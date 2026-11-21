@@ -418,6 +418,30 @@ def notes_from_midi(path, family):
     return sorted(chosen, key=lambda n: n.start), sorted(rest, key=lambda n: n.start), labels
 
 
+def cross_check(notes, others, tol=0.15):
+    """Mark which notes a second, independent note source also wrote; return the ones only it wrote.
+
+    Two detectors built differently and trained on different recordings rarely invent the same
+    note, so a note both wrote is far more likely to be real than a note only one wrote (on a
+    string quartet neither had heard: 94% against 69% and 46%). Nothing about the instruments
+    is assumed. Notes pair off one to one: same pitch, starts within `tol` seconds, nearest
+    first. Pairing by "the other source has this pitch sounding" was tried and confirms the
+    extra pieces of a held note that one source wrote in fragments, which are mostly wrong.
+    Sets note.seen to 1.0 (both) or 0.5 (one) on both lists."""
+    by_pitch = {}
+    for o in others:
+        o.seen = 0.5
+        by_pitch.setdefault(o.pitch, []).append(o)
+    pairs = []
+    for n in notes:
+        n.seen = 0.5
+        pairs += [(abs(o.start - n.start), id(n), id(o), n, o) for o in by_pitch.get(n.pitch, []) if abs(o.start - n.start) <= tol]
+    for _, _, _, n, o in sorted(pairs, key=lambda p: p[:3]):
+        if n.seen < 1.0 and o.seen < 1.0:
+            n.seen = o.seen = 1.0
+    return [o for o in others if o.seen < 1.0]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio")
@@ -428,6 +452,7 @@ def main():
     ap.add_argument("--min-ms", type=float, default=58.0, help="shortest note to keep")
     ap.add_argument("--canon", nargs="?", const="auto", default=None, metavar="SECONDS", help="the piece is a canon or round at the same pitch: divide the players by the delay between them (found from the notes, or given in seconds). Not automatic, because ordinary accompaniment figures repeat too")
     ap.add_argument("--notes-from", default=None, help="take the notes from this MIDI file (for example one written by scripts/run_yourmt3.py) instead of running the built-in detector")
+    ap.add_argument("--cross-check", action="store_true", help="with --notes-from: also run the built-in detector and mark every note only one of the two wrote as unsure. When the model hears one family almost alone (9 notes in 10), the notes only the built-in detector wrote, and the notes the model gave to some other instrument, are added as unsure notes too")
     ap.add_argument("--join-held", action="store_true", help="with --notes-from: also join a held note written twice (off by default; it cost 2 points of notes found on both recordings that have an answer key)")
     ap.add_argument("--lowest", default=None, help="lowest note these instruments can play, e.g. G3 for violins; anything below it cannot be theirs and goes to the accompaniment")
     ap.add_argument("--family", default="strings", choices=sorted(FAMILIES), help="which instrument family in that MIDI file holds the two lines to split")
@@ -463,6 +488,22 @@ def main():
             before = len(notes)
             notes = amt.merge_held(notes, y)
             source["held_notes_joined"] = before - len(notes)
+        if args.cross_check:
+            plain = amt.merge_held(amt.poly_notes(args.audio, fmin=args.fmin, fmax=args.fmax, onset=args.onset, frame=args.frame, min_ms=args.min_ms), y)
+            if args.lowest:
+                plain = [n for n in plain if n.pitch >= floor]
+            in_range = [n for n in accompaniment if not args.lowest or n.pitch >= floor]
+            one_family = len(notes) >= 0.9 * (len(notes) + len(accompaniment))
+            only_plain = cross_check(notes + (in_range if one_family else []), plain)
+            source["cross_check"] = {"written_by_both": sum(n.seen >= 1.0 for n in notes), "written_by_the_model_only": sum(n.seen < 1.0 for n in notes), "one_family_recording": bool(one_family)}
+            if one_family:
+                # nothing else is playing, so a note either source wrote can only belong to this family
+                strays = {id(n) for n in in_range}
+                for n in in_range:
+                    n.seen = min(n.seen, 0.5)  # the model itself doubted it
+                source["cross_check"].update(added_from_built_in_detector=len(only_plain), returned_from_other_instrument_tracks=len(in_range))
+                notes = sorted(notes + in_range + only_plain, key=lambda n: n.start)
+                accompaniment = [n for n in accompaniment if id(n) not in strays]
     else:
         raw = amt.poly_notes(args.audio, fmin=args.fmin, fmax=args.fmax, onset=args.onset, frame=args.frame, min_ms=args.min_ms)
         notes = drop_overtone_ghosts(raw) if args.drop_overtones else list(raw)
@@ -527,6 +568,7 @@ def main():
         "chroma_agreement_with_audio": amt.chroma_agreement(A + B, y),
         "how_parts_were_split": stereo,
         "notes_where_tone_disputes_the_split": None if disputed is None else len(disputed) / max(len(A) + len(B), 1),
+        "notes_only_one_source_wrote": sum(n.seen < 1.0 for n in A + B) / max(len(A) + len(B), 1) if args.cross_check else None,
         "tempo_bpm": bpm,
         "beat_jitter": jitter,
     }

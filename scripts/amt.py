@@ -21,6 +21,7 @@ class Note:
     conf: float = 1.0  # 0..1, how sure the pitch is (single-line parts only)
     off: float = 0.0  # how far the sung pitch sat from the written note, in semitones (+ = sharp)
     eff: float = 0.0  # length of the held note this fragment belongs to (see duet.effective_durations)
+    seen: float = 1.0  # share of the independent note sources that wrote this note (see duet.cross_check)
 
     @property
     def dur(self):
@@ -483,7 +484,7 @@ def warp(notes, beats, bpm, grid=None):
         if grid:
             s = round(s * grid) / grid
             e = max(round(e * grid) / grid, s + 1.0 / grid)
-        out.append(Note(s * 60 / bpm, e * 60 / bpm, n.pitch, n.amp, n.conf, n.off))
+        out.append(Note(s * 60 / bpm, e * 60 / bpm, n.pitch, n.amp, n.conf, n.off, seen=n.seen))
     return out
 
 
@@ -655,8 +656,10 @@ def write_musicxml(path, tracks, bpm, key=None, meter="4/4", unsure_below=None, 
             ql = max(0.25, round(max(g.end - g.start for g in group) / spb * 4) / 4)
             el = m21note.Note(group[0].pitch) if len(group) == 1 else m21chord.Chord(sorted({g.pitch for g in group}))
             el.quarterLength = ql
-            if unsure_below is not None and unsure_style == "color" and any(g.conf < unsure_below for g in group):
-                el.style.color = "#d00000"  # the independent checks disagree about this note
+            if unsure_style == "color" and any(g.seen < 1.0 for g in group):
+                el.style.color = "#1f6fd0"  # only one of two note sources wrote this note: it may not be real
+            elif unsure_below is not None and unsure_style == "color" and any(g.conf < unsure_below for g in group):
+                el.style.color = "#d00000"  # the independent checks disagree about who plays this note
             elif unsure_below is not None and len(group) == 1 and group[0].conf < unsure_below:
                 el.notehead = "x"  # pitch is a guess: spoken or unclear
             part.insert(on, el)

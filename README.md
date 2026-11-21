@@ -36,6 +36,7 @@ The benchmark row flatters the model, since URMP is among the data it was traine
 ```bash
 .venv_mt3/bin/python scripts/run_yourmt3.py recording.wav out/my_piece/model.mid
 python -I scripts/duet.py recording.wav out/my_piece --notes-from out/my_piece/model.mid --lowest G3
+python -I scripts/duet.py recording.wav out/my_piece --notes-from out/my_piece/model.mid --lowest G3 --cross-check   # mark notes only one detector wrote
 ```
 
 The model's code and checkpoint are not part of this repository: they go under `tools/yourmt3/`, with their own environment in `.venv_mt3`.
@@ -44,18 +45,33 @@ The model's code and checkpoint are not part of this repository: they go under `
 
 The benchmark above is studio audio that the instrument-aware model was trained on, so the fairer test is recordings from outside any training set, checked against scores that are already machine-readable (the music21 corpus and the Mutopia Project), with no page reading involved. `scripts/eval_ensemble.py` lines the score up with the recording, finds the transposition if the edition or the tuning differs, and counts.
 
-| Recording | Notes found: model | plain detector | Written notes in the score: model | plain detector | Found notes given to the right player |
+| Recording | Notes found (recall): model | plain detector | Written notes in the score (precision): model | plain detector | Found notes given to the right player |
 |---|---|---|---|---|---|
 | Bach, Prelude in C, BWV 846 (piano) | **93%** | 85% | **91%** | 58% | one player |
-| Mozart, quartet K. 458, Adagio | **87%** | | 77% | | 84% of four |
-| Joplin, Maple Leaf Rag (piano) | 84% | 75% | 77% | 67% | one player |
-| Telemann, canonic sonata no. 1, Vivace (two violins) | 79% | **82%** | 74% | **82%** | 80% with the canon rule, 50% without |
-| Beethoven, quartet Op. 18 No. 1, Adagio (live) | 48% | | 42% | | 71% of four |
+| Mozart, quartet K. 458, Adagio | **87%** | 74% | 76% | 74% | 84% of four |
+| Joplin, Maple Leaf Rag (piano) | **84%** | 75% | **77%** | 67% | one player |
+| Telemann, canonic sonata no. 1, Vivace (two violins) | 79% | **82%** | 73% | **82%** | 80% with the canon rule, 50% without |
+| Beethoven, quartet Op. 18 No. 1, Adagio (live) | 48% | 41% | 42% | 43% | 71% of four |
 | Bach, chorale from the motet BWV 227 (choir) | 41% | 52% | 40% | 40% | 78 to 85% of four |
 
 Between 6% and 32% of notes would count as found by coincidence, most on the rag, whose sections repeat. Three things stand out. The instrument-aware model is not uniformly better: on two violins alone the plain detector with the held-note check matches or beats it. A live quartet in a slow movement is far harder than a studio one, and even ignoring fine timing only 68% of its pitches turn up in the right five-second stretch, against 89% for the Mozart. And voices are the weakest case of all: the model hears a choir mostly as strings and finds two notes in five, the plain detector finds the sopranos (81%) and loses the tenors (32%).
 
 Dividing four players uses the same evidence as dividing two, plus the lowest note each instrument can produce (`split_voices` in `scripts/duet.py`); it beats stacking the notes top to bottom on the quartets and loses to it on the chorale, where all four voices move together. A canon defeats both, because the two players share one register and one line; there the players are told apart by the delay between them, found from pairs of notes that come back a fixed time later (`--canon`). Ordinary accompaniment figures repeat just as strongly at short delays, so that rule is an option and not automatic. Left/right position, which settled the two violins with piano, adds about a point on these quartets: the four players sit too close together in the stereo image.
+
+### When the two detectors agree
+
+The plain detector and the instrument-aware model are different networks trained on different recordings, so the working guess was that they seldom invent the same note. `scripts/eval_detectors.py` tests it by pairing their notes one to one (same pitch, starts within 0.15 s) and scoring each group against the score.
+
+| Recording | Precision when both wrote the note | Only the model wrote it | Only the plain detector wrote it | Recall of the agreed notes alone | Recall of everything either wrote |
+|---|---|---|---|---|---|
+| Mozart quartet | **94%** | 69% | 46% | 61% | 93% |
+| Bach prelude (piano) | 91% | 86% | 12% | 81% | 94% |
+| Telemann (two violins) | **90%** | 54% | 68% | 70% | 90% |
+| Joplin rag (piano) | 78% | 73% | 41% | 72% | 85% |
+| Bach chorale (choir) | **66%** | 37% | 39% | 12% | 69% |
+| Beethoven quartet (live) | 56% | 36% | 30% | 29% | 56% |
+
+Agreement is the best single sign that a note is real on every one of the six, by 14 to 26 points over either source alone wherever strings or voices are involved, and it asks nothing about the instruments. On a piano the model needs no help: what only the plain detector wrote there is mostly overtones. `duet.py --cross-check` puts this to use. Notes only one source wrote are kept and coloured blue in the score, so the page shows which notes to check by ear. When the model hears one family almost alone (nine notes in ten), the notes only the plain detector wrote are added as well, since nothing else is playing that they could belong to; on the Telemann duet that lifts the notes found from 81% to 87%, with the doubtful 38% marked. With a piano in the room the plain detector's extra notes cannot be told from piano notes (8% of them are violin notes on the piece with piano), so there the rule only marks. Counting a note as agreed when the other source merely has that pitch sounding was tried and dropped: it mostly confirms the extra pieces of a held note that one source wrote in fragments.
 
 Lining the score up by individual notes instead of by harmony cut the typical timing error on the benchmark from 47 ms to 27 ms, and slow movements needed the score stretched to the recording's length first, since the alignment cannot bend the tempo by more than a factor of two.
 
@@ -119,6 +135,7 @@ The duet tool also asks a question that does not depend on pitch movement: which
 - `scripts/duet.py` is the two-instrument path, including the part splitter.
 - `scripts/run_yourmt3.py` runs the instrument-aware model whose output `duet.py` can take in place of its own detector.
 - `scripts/eval_urmp.py`, `scripts/eval_score.py` and `scripts/eval_ensemble.py` are the checkers: against the benchmark's annotations, against a score read from pages, and against a machine-readable score for any number of players.
+- `scripts/eval_detectors.py` gives recall and precision for both note sources on one recording, and for the notes they agree and disagree on.
 - `scripts/build_score_dataset.sh`, `scripts/helper_barlines.py`, `scripts/omr_stitch.py` and `scripts/align_dataset.py` are the sheet-music path.
 - `scripts/tone_experiment.py` is the tone experiment behind the second opinion, `scripts/rearticulation_experiment.py` the one behind the held-note check, and `scripts/instrument_experiment.py` an attempt to tell struck notes from bowed ones that did not work well enough to use (69% against 59% for guessing).
 - `scripts/plot_line.py` and `scripts/probe_stereo.py` are small diagnostics.
